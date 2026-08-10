@@ -1,0 +1,2 @@
+<% content_for :title, "New Project" %>
+<div id="vue-app" data-page="new-project" data-props="<%= json_escape({ project: { name: @project.name, description: @project.description }, errors: @project.errors.full_messages }.to_json) %>"></div>
