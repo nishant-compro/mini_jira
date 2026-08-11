@@ -2,9 +2,12 @@ name: Build
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     types: [opened, synchronize, reopened]
+concurrency:
+  group: sonar-jira-${{ github.ref }}
+  queue: max
 jobs:
   sonarqube:
     name: SonarQube
@@ -14,6 +17,136 @@ jobs:
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
       - name: SonarQube Scan
+        id: sonar_scan
+        continue-on-error: true
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=600
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Create Jira tickets for new Sonar issues
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SONAR_PROJECT_KEY: personal-poc_mini-jira
+          JIRA_PROJECT_KEY: SCRUM
+          JIRA_BASE_URL: https://comprotechnologies-team-koxwvmhf.atlassian.net
+        run: |
+          set -euo pipefail
+
+          metadata_file=".scannerwork/report-task.txt"
+          if [ ! -f "$metadata_file" ]; then
+            echo "::error::Sonar analysis metadata was not produced; Jira synchronization cannot run."
+            exit 1
+          fi
+
+          ce_task_url=$(sed -n 's/^ceTaskUrl=//p' "$metadata_file")
+          if [ -z "$ce_task_url" ]; then
+            echo "::error::Sonar analysis metadata does not contain ceTaskUrl."
+            exit 1
+          fi
+
+          ce_status=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "$ce_task_url" | jq -er '.task.status')
+
+          if [ "$ce_status" != "SUCCESS" ]; then
+            echo "::error::Sonar analysis task is ${ce_status}; Jira synchronization cannot run yet."
+            exit 1
+          fi
+
+          issues_json=$(curl --fail-with-body --silent --show-error --get \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
+            --data-urlencode "branch=main" \
+            --data-urlencode "resolved=false" \
+            --data-urlencode "ps=500" \
+            "https://sonarcloud.io/api/issues/search")
+
+          echo "$issues_json" | jq -c '.issues[]' | while read -r issue; do
+            sonar_key=$(echo "$issue" | jq -r '.key')
+            message=$(echo "$issue" | jq -r '.message')
+            summary=$(echo "$issue" | jq -r '"[Sonar] " + .message | .[0:250]')
+            rule=$(echo "$issue" | jq -r '.rule')
+            severity=$(echo "$issue" | jq -r '.severity')
+            component=$(echo "$issue" | jq -r '.component')
+            line=$(echo "$issue" | jq -r '.line // "Not specified"')
+            label="sonar-${sonar_key}"
+
+            sonar_url="https://sonarcloud.io/project/issues?id=${SONAR_PROJECT_KEY}&open=${sonar_key}"
+
+            search_payload=$(jq -n \
+              --arg jql "project = ${JIRA_PROJECT_KEY} AND labels = \"${label}\"" \
+              '{jql: $jql, maxResults: 1, fields: ["key"]}')
+
+            existing_count=$(curl --fail-with-body --silent --show-error \
+              --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data "$search_payload" \
+              "${JIRA_BASE_URL}/rest/api/3/search/jql" |
+              jq '.issues | length')
+
+            if [ "$existing_count" -gt 0 ]; then
+              echo "Jira ticket already exists for Sonar issue ${sonar_key}"
+              continue
+            fi
+
+            create_payload=$(jq -n \
+              --arg project "$JIRA_PROJECT_KEY" \
+              --arg summary "$summary" \
+              --arg message "$message" \
+              --arg rule "$rule" \
+              --arg severity "$severity" \
+              --arg component "$component" \
+              --arg line "$line" \
+              --arg sonar_url "$sonar_url" \
+              --arg label "$label" \
+              '{
+                fields: {
+                  project: {key: $project},
+                  issuetype: {name: "Bug"},
+                  summary: $summary,
+                  labels: ["sonarcloud", $label],
+                  description: {
+                    type: "doc",
+                    version: 1,
+                    content: [
+                      {
+                        type: "paragraph",
+                        content: [{type: "text", text: $message}]
+                      },
+                      {
+                        type: "paragraph",
+                        content: [{
+                          type: "text",
+                          text: ("Rule: " + $rule +
+                                "\nSeverity: " + $severity +
+                                "\nComponent: " + $component +
+                                "\nLine: " + $line +
+                                "\nSonarCloud: " + $sonar_url)
+                        }]
+                      }
+                    ]
+                  }
+                }
+              }')
+
+            created=$(curl --fail-with-body --silent --show-error \
+              --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data "$create_payload" \
+              "${JIRA_BASE_URL}/rest/api/3/issue")
+
+            echo "Created Jira ticket $(echo "$created" | jq -r '.key')"
+          done
+      - name: Propagate SonarQube scan or quality gate failure
+        if: ${{ !cancelled() && steps.sonar_scan.outcome == 'failure' }}
+        run: |
+          echo "::error::SonarQube scan or quality gate failed."
+          exit 1
