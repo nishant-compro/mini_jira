@@ -16,6 +16,70 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - name: SonarQube preflight diagnostics
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          properties_file="sonar-project.properties"
+          if [ ! -f "$properties_file" ]; then
+            echo "::error::${properties_file} was not found in $(pwd)."
+            exit 1
+          fi
+
+          project_key=$(sed -n \
+            's/^[[:space:]]*sonar\.projectKey[[:space:]]*=[[:space:]]*//p' \
+            "$properties_file" | tail -n 1)
+          organization=$(sed -n \
+            's/^[[:space:]]*sonar\.organization[[:space:]]*=[[:space:]]*//p' \
+            "$properties_file" | tail -n 1)
+
+          echo "::group::SonarQube configuration"
+          echo "Server: https://sonarcloud.io"
+          echo "Project key: ${project_key:-<missing>}"
+          echo "Organization: ${organization:-<missing>}"
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "Ref: ${GITHUB_REF}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "::endgroup::"
+
+          if [ -z "$project_key" ] || [ -z "$organization" ]; then
+            echo "::error::sonar.projectKey or sonar.organization is missing from ${properties_file}."
+            exit 1
+          fi
+
+          if [ -z "${SONAR_TOKEN:-}" ]; then
+            echo "::error::SONAR_TOKEN is not available to this workflow run. Check the repository secret and whether this is a fork pull request."
+            exit 1
+          fi
+          echo "SONAR_TOKEN is present; its value has not been printed."
+
+          auth_response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "https://sonarcloud.io/api/authentication/validate")
+          auth_valid=$(printf '%s' "$auth_response" | jq -er '.valid')
+          if [ "$auth_valid" != "true" ]; then
+            echo "::error::SonarCloud rejected SONAR_TOKEN. Generate a new token and update the repository secret."
+            exit 1
+          fi
+          echo "SonarCloud authentication: valid"
+
+          if ! project_response=$(curl --fail-with-body --silent --show-error --get \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            --data-urlencode "component=${project_key}" \
+            "https://sonarcloud.io/api/components/show"); then
+            project_error=$(printf '%s' "$project_response" | \
+              jq -r '[.errors[]?.msg] | join("; ")' 2>/dev/null || true)
+            echo "::error::The token is valid but project '${project_key}' is not accessible${project_error:+: ${project_error}}. Check the project key, organization, and token user's permissions."
+            exit 1
+          fi
+
+          visible_key=$(printf '%s' "$project_response" | jq -er '.component.key')
+          qualifier=$(printf '%s' "$project_response" | jq -r '.component.qualifier // "unknown"')
+          visibility=$(printf '%s' "$project_response" | jq -r '.component.visibility // "unknown"')
+          echo "SonarCloud project access: key=${visible_key}, qualifier=${qualifier}, visibility=${visibility}"
+          echo "Preflight passed. If analysis is still unauthorized, verify that this token's user has Execute Analysis permission on the project."
       - name: SonarQube Scan
         id: sonar_scan
         continue-on-error: true
