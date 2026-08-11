@@ -58,7 +58,7 @@ jobs:
           auth_response=$(curl --fail-with-body --silent --show-error \
             -H "Authorization: Bearer ${SONAR_TOKEN}" \
             "https://sonarcloud.io/api/authentication/validate")
-          auth_valid=$(printf '%s' "$auth_response" | jq -er '.valid')
+          auth_valid=$(printf '%s' "$auth_response" | jq -r '.valid // false')
           if [ "$auth_valid" != "true" ]; then
             echo "::error::SonarCloud rejected SONAR_TOKEN. Generate a new token and update the repository secret."
             exit 1
@@ -114,22 +114,59 @@ jobs:
             exit 1
           fi
 
-          ce_status=$(curl --fail-with-body --silent --show-error \
+          echo "Checking Sonar analysis task status..."
+          if ! ce_response=$(curl --fail-with-body --silent --show-error \
             -H "Authorization: Bearer ${SONAR_TOKEN}" \
-            "$ce_task_url" | jq -er '.task.status')
+            "$ce_task_url"); then
+            echo "::error::Sonar analysis task lookup failed."
+            printf '%s' "$ce_response" | jq -c '.' 2>/dev/null || true
+            exit 1
+          fi
+          ce_status=$(printf '%s' "$ce_response" | jq -er '.task.status')
 
           if [ "$ce_status" != "SUCCESS" ]; then
             echo "::error::Sonar analysis task is ${ce_status}; Jira synchronization cannot run yet."
             exit 1
           fi
+          echo "Sonar analysis task status: ${ce_status}"
 
-          issues_json=$(curl --fail-with-body --silent --show-error --get \
+          echo "Loading unresolved Sonar issues for branch main..."
+          if ! issues_json=$(curl --fail-with-body --silent --show-error --get \
             -H "Authorization: Bearer ${SONAR_TOKEN}" \
             --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
             --data-urlencode "branch=main" \
             --data-urlencode "resolved=false" \
             --data-urlencode "ps=500" \
-            "https://sonarcloud.io/api/issues/search")
+            "https://sonarcloud.io/api/issues/search"); then
+            echo "::error::Sonar issue search failed."
+            printf '%s' "$issues_json" | jq -c '.' 2>/dev/null || true
+            exit 1
+          fi
+          sonar_issue_count=$(printf '%s' "$issues_json" | jq -er '.issues | length')
+          echo "Unresolved Sonar issues returned: ${sonar_issue_count}"
+
+          echo "Checking Jira authentication and project permissions..."
+          if ! jira_permissions=$(curl --fail-with-body --silent --show-error --get \
+            --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            -H "Accept: application/json" \
+            --data-urlencode "projectKey=${JIRA_PROJECT_KEY}" \
+            --data-urlencode "permissions=BROWSE_PROJECTS,CREATE_ISSUES" \
+            "${JIRA_BASE_URL}/rest/api/3/mypermissions"); then
+            echo "::error::Jira permission lookup failed. If this is a scoped API token, the site URL cannot be used; use an unscoped token or the api.atlassian.com URL with the Jira cloud ID."
+            printf '%s' "$jira_permissions" | jq -c '.' 2>/dev/null || true
+            exit 1
+          fi
+
+          can_browse=$(printf '%s' "$jira_permissions" | \
+            jq -r '.permissions.BROWSE_PROJECTS.havePermission // false')
+          can_create=$(printf '%s' "$jira_permissions" | \
+            jq -r '.permissions.CREATE_ISSUES.havePermission // false')
+          echo "Jira permissions for ${JIRA_PROJECT_KEY}: BROWSE_PROJECTS=${can_browse}, CREATE_ISSUES=${can_create}"
+
+          if [ "$can_browse" != "true" ] || [ "$can_create" != "true" ]; then
+            echo "::error::The Jira token's user lacks Browse Projects or Create Issues permission in ${JIRA_PROJECT_KEY}."
+            exit 1
+          fi
 
           echo "$issues_json" | jq -c '.issues[]' | while read -r issue; do
             sonar_key=$(echo "$issue" | jq -r '.key')
@@ -147,13 +184,18 @@ jobs:
               --arg jql "project = ${JIRA_PROJECT_KEY} AND labels = \"${label}\"" \
               '{jql: $jql, maxResults: 1, fields: ["key"]}')
 
-            existing_count=$(curl --fail-with-body --silent --show-error \
+            echo "Checking Jira for existing ticket with label ${label}..."
+            if ! search_response=$(curl --fail-with-body --silent --show-error \
               --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
               -H "Accept: application/json" \
               -H "Content-Type: application/json" \
               --data "$search_payload" \
-              "${JIRA_BASE_URL}/rest/api/3/search/jql" |
-              jq '.issues | length')
+              "${JIRA_BASE_URL}/rest/api/3/search/jql"); then
+              echo "::error::Jira issue search failed for Sonar issue ${sonar_key}."
+              printf '%s' "$search_response" | jq -c '.' 2>/dev/null || true
+              exit 1
+            fi
+            existing_count=$(printf '%s' "$search_response" | jq -er '.issues | length')
 
             if [ "$existing_count" -gt 0 ]; then
               echo "Jira ticket already exists for Sonar issue ${sonar_key}"
@@ -200,12 +242,17 @@ jobs:
                 }
               }')
 
-            created=$(curl --fail-with-body --silent --show-error \
+            echo "Creating Jira ticket for Sonar issue ${sonar_key}..."
+            if ! created=$(curl --fail-with-body --silent --show-error \
               --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
               -H "Accept: application/json" \
               -H "Content-Type: application/json" \
               --data "$create_payload" \
-              "${JIRA_BASE_URL}/rest/api/3/issue")
+              "${JIRA_BASE_URL}/rest/api/3/issue"); then
+              echo "::error::Jira issue creation failed for Sonar issue ${sonar_key}."
+              printf '%s' "$created" | jq -c '.' 2>/dev/null || true
+              exit 1
+            fi
 
             echo "Created Jira ticket $(echo "$created" | jq -r '.key')"
           done
