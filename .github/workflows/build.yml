@@ -98,6 +98,7 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           SONAR_PROJECT_KEY: personal-poc_mini-jira
           JIRA_PROJECT_KEY: SCRUM
+          JIRA_PREFERRED_ISSUE_TYPE: Bug
           JIRA_BASE_URL: https://comprotechnologies-team-koxwvmhf.atlassian.net
         run: |
           set -euo pipefail
@@ -168,6 +169,38 @@ jobs:
             exit 1
           fi
 
+          echo "Loading create-enabled Jira issue types for ${JIRA_PROJECT_KEY}..."
+          if ! issue_types_response=$(curl --fail-with-body --silent --show-error --get \
+            --user "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            -H "Accept: application/json" \
+            --data-urlencode "maxResults=100" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/createmeta/${JIRA_PROJECT_KEY}/issuetypes"); then
+            echo "::error::Unable to load create-enabled issue types for ${JIRA_PROJECT_KEY}."
+            printf '%s' "$issue_types_response" | jq -c '.' 2>/dev/null || true
+            exit 1
+          fi
+
+          selected_issue_type=$(printf '%s' "$issue_types_response" | jq -c \
+            --arg preferred "$JIRA_PREFERRED_ISSUE_TYPE" '
+              [.issueTypes[] |
+                select((.subtask // false) == false and
+                       (.hierarchyLevel // 0) == 0)] as $types |
+              ($types | map(select(.name == $preferred))[0]) //
+              ($types | map(select(.name == "Task"))[0]) //
+              $types[0] // empty
+            ')
+
+          if [ -z "$selected_issue_type" ]; then
+            available_types=$(printf '%s' "$issue_types_response" | \
+              jq -r '[.issueTypes[]?.name] | join(", ")')
+            echo "::error::No standard create-enabled Jira issue type is available. Returned types: ${available_types:-none}."
+            exit 1
+          fi
+
+          issue_type_id=$(printf '%s' "$selected_issue_type" | jq -er '.id')
+          issue_type_name=$(printf '%s' "$selected_issue_type" | jq -er '.name')
+          echo "Selected Jira issue type: ${issue_type_name} (ID ${issue_type_id})"
+
           echo "$issues_json" | jq -c '.issues[]' | while read -r issue; do
             sonar_key=$(echo "$issue" | jq -r '.key')
             message=$(echo "$issue" | jq -r '.message')
@@ -212,10 +245,11 @@ jobs:
               --arg line "$line" \
               --arg sonar_url "$sonar_url" \
               --arg label "$label" \
+              --arg issue_type_id "$issue_type_id" \
               '{
                 fields: {
                   project: {key: $project},
-                  issuetype: {name: "Bug"},
+                  issuetype: {id: $issue_type_id},
                   summary: $summary,
                   labels: ["sonarcloud", $label],
                   description: {
