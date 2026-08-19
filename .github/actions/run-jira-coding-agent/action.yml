@@ -127,7 +127,7 @@ runs:
         AWS_REGION: ${{ inputs.aws-region }}
         AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
         ANTHROPIC_BASE_URL: ${{ inputs.model-provider == 'openrouter' && 'https://openrouter.ai/api' || '' }}
-        ANTHROPIC_AUTH_TOKEN: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
+        ANTHROPIC_CUSTOM_HEADERS: "${{ inputs.model-provider == 'openrouter' && format('Authorization: Bearer {0}', inputs.openrouter-api-key) || '' }}"
       with:
         github_token: ${{ github.token }}
         anthropic_api_key: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
