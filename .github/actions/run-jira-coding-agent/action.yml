@@ -129,6 +129,7 @@ runs:
         ANTHROPIC_BASE_URL: ${{ inputs.model-provider == 'openrouter' && 'https://openrouter.ai/api' || '' }}
         ANTHROPIC_AUTH_TOKEN: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
       with:
+        github_token: ${{ github.token }}
         anthropic_api_key: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
         use_bedrock: ${{ inputs.model-provider == 'bedrock' && 'true' || 'false' }}
         prompt: ${{ inputs.prompt }}
