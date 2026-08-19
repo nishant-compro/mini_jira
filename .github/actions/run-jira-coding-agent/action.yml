@@ -117,7 +117,11 @@ runs:
     - name: Install pinned Claude Code CLI for OpenRouter
       if: inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter'
       shell: bash
-      run: npm install --global "@anthropic-ai/claude-code@2.1.228"
+      run: |
+        set -euo pipefail
+        npm install --global --allow-scripts=@anthropic-ai/claude-code \
+          "@anthropic-ai/claude-code@2.1.228"
+        claude --version
 
     - name: Configure scoped AWS credentials
       id: aws
@@ -185,7 +189,23 @@ runs:
           )
         fi
 
+        set +e
         printf '%s\n' "$PROMPT" | claude "${args[@]}" > "$EXECUTION_FILE"
+        claude_status=$?
+        set -e
+        if [ "$claude_status" -ne 0 ]; then
+          if [ -s "$EXECUTION_FILE" ] && jq -e . "$EXECUTION_FILE" > /dev/null 2>&1; then
+            provider_error=$(jq -r '
+              (.result // (.errors // [] | join("; ")) // .error // "No provider error was returned")
+              | tostring | gsub("[\\r\\n]+"; " ")
+            ' "$EXECUTION_FILE" | cut -c1-2000)
+            printf 'Claude Code failed: %s\n' "$provider_error" >&2
+          else
+            echo "Claude Code failed without a JSON execution result" >&2
+          fi
+          exit "$claude_status"
+        fi
+
         jq -er 'select(.type == "result" and .subtype == "success" and .is_error == false) | .result | strings' \
           "$EXECUTION_FILE" > "$SUMMARY_FILE"
         jq -e '
