@@ -51,8 +51,6 @@ runs:
       env:
         MODE: ${{ inputs.mode }}
         MODEL: ${{ inputs.model }}
-        MODEL_PROVIDER: ${{ inputs.model-provider }}
-        PROMPT: ${{ inputs.prompt }}
       run: |
         set -euo pipefail
         case "$MODE" in
@@ -75,23 +73,14 @@ runs:
             echo '--allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"'
             echo '--disallowedTools "WebFetch,WebSearch,Bash(gh:*),Bash(git push:*),Bash(git commit:*),Bash(git merge:*),Bash(curl:*),Bash(wget:*)"'
           fi
-          if [ "$MODEL_PROVIDER" != openrouter ]; then
-            printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
-          fi
+          printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
         } > "$args_file"
 
         delimiter="claude_args_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$MODE"
-        prompt_delimiter="claude_prompt_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$MODE"
         {
           echo "claude_args<<$delimiter"
           cat "$args_file"
           echo "$delimiter"
-          echo "claude_prompt<<$prompt_delimiter"
-          printf '%s\n\n' "$PROMPT"
-          echo "Finish with only a JSON object matching this schema, without Markdown fences:"
-          tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json"
-          echo
-          echo "$prompt_delimiter"
           echo "summary_file=$summary_file"
           echo "execution_file=$execution_file"
           if [ "$MODE" = validate ]; then
@@ -149,7 +138,7 @@ runs:
       with:
         github_token: ${{ github.token }}
         use_bedrock: "true"
-        prompt: ${{ steps.prepare.outputs.claude_prompt }}
+        prompt: ${{ inputs.prompt }}
         claude_args: ${{ steps.prepare.outputs.claude_args }}
 
     - name: Run Claude Code directly through OpenRouter
@@ -164,14 +153,16 @@ runs:
         ANTHROPIC_BASE_URL: https://openrouter.ai/api
         MODE: ${{ inputs.mode }}
         MODEL: ${{ inputs.model }}
-        PROMPT: ${{ steps.prepare.outputs.claude_prompt }}
+        PROMPT: ${{ inputs.prompt }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
+        SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
       run: |
         set -euo pipefail
         args=(
           --print
           --output-format json
+          --json-schema "$(tr -d '\n' < "$SCHEMA_FILE")"
           --model "$MODEL"
           --no-session-persistence
         )
@@ -206,7 +197,7 @@ runs:
           exit "$claude_status"
         fi
 
-        jq -er 'select(.type == "result" and .subtype == "success" and .is_error == false) | .result | strings' \
+        jq -e 'select(.type == "result" and .subtype == "success" and .is_error == false) | .structured_output | objects' \
           "$EXECUTION_FILE" > "$SUMMARY_FILE"
         jq -e '
           type == "object" and
