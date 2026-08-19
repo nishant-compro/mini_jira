@@ -38,7 +38,7 @@ inputs:
 outputs:
   structured_output:
     description: Agent-neutral JSON summary matching summary.schema.json
-    value: ${{ steps.normalize_claude_openrouter.outputs.structured_output || steps.claude.outputs.structured_output || steps.codex_openrouter.outputs['final-message'] || steps.codex_bedrock.outputs.structured_output }}
+    value: ${{ steps.claude_openrouter.outputs.structured_output || steps.claude.outputs.structured_output || steps.codex_openrouter.outputs['final-message'] || steps.codex_bedrock.outputs.structured_output }}
   execution_file:
     description: Path to the available execution evidence
     value: ${{ steps.claude.outputs.execution_file || steps.prepare.outputs.execution_file }}
@@ -103,8 +103,8 @@ runs:
           fi
         } >> "$GITHUB_OUTPUT"
 
-    - name: Prepare Node.js for Codex on Bedrock
-      if: inputs.coding-agent == 'codex' && inputs.model-provider == 'bedrock'
+    - name: Prepare Node.js for direct coding agent
+      if: (inputs.coding-agent == 'codex' && inputs.model-provider == 'bedrock') || (inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter')
       uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
       with:
         node-version: "24"
@@ -113,6 +113,11 @@ runs:
       if: inputs.coding-agent == 'codex' && inputs.model-provider == 'bedrock'
       shell: bash
       run: npm install --global "@openai/codex@0.147.0"
+
+    - name: Install pinned Claude Code CLI for OpenRouter
+      if: inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter'
+      shell: bash
+      run: npm install --global "@anthropic-ai/claude-code@2.1.228"
 
     - name: Configure scoped AWS credentials
       id: aws
@@ -125,9 +130,9 @@ runs:
         output-env-credentials: false
         output-credentials: true
 
-    - name: Run Claude Code
+    - name: Run Claude Code through Bedrock
       id: claude
-      if: inputs.coding-agent == 'claude-code'
+      if: inputs.coding-agent == 'claude-code' && inputs.model-provider == 'bedrock'
       uses: anthropics/claude-code-action@239e3a730883eeb5c53db12b0fc9573b3024b126 # v1
       env:
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
@@ -137,34 +142,52 @@ runs:
         AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
         AWS_REGION: ${{ inputs.aws-region }}
         AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
-        ANTHROPIC_BASE_URL: ${{ inputs.model-provider == 'openrouter' && 'https://openrouter.ai/api' || '' }}
-        ANTHROPIC_CUSTOM_HEADERS: "${{ inputs.model-provider == 'openrouter' && format('Authorization: Bearer {0}', inputs.openrouter-api-key) || '' }}"
       with:
         github_token: ${{ github.token }}
-        anthropic_api_key: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
-        use_bedrock: ${{ inputs.model-provider == 'bedrock' && 'true' || 'false' }}
+        use_bedrock: "true"
         prompt: ${{ steps.prepare.outputs.claude_prompt }}
         claude_args: ${{ steps.prepare.outputs.claude_args }}
 
-    - name: Normalize Claude OpenRouter result
-      id: normalize_claude_openrouter
+    - name: Run Claude Code directly through OpenRouter
+      id: claude_openrouter
       if: inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter'
       shell: bash
       env:
-        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+        ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        ANTHROPIC_API_KEY: ""
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.openrouter-api-key }}
+        ANTHROPIC_BASE_URL: https://openrouter.ai/api
+        MODE: ${{ inputs.mode }}
+        MODEL: ${{ inputs.model }}
+        PROMPT: ${{ steps.prepare.outputs.claude_prompt }}
+        EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
       run: |
         set -euo pipefail
-        if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
-          echo "::error::Claude did not provide an execution result"
-          exit 1
+        args=(
+          --print
+          --output-format json
+          --model "$MODEL"
+          --no-session-persistence
+        )
+        if [ "$MODE" = validate ]; then
+          args+=(--max-turns 2 --max-budget-usd 1 --tools "")
+        else
+          args+=(
+            --max-turns 25
+            --max-budget-usd 10
+            --permission-mode dontAsk
+            --allowedTools
+            "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"
+            --disallowedTools
+            "WebFetch,WebSearch,Bash(gh:*),Bash(git push:*),Bash(git commit:*),Bash(git merge:*),Bash(curl:*),Bash(wget:*)"
+          )
         fi
 
-        messages_file="$RUNNER_TEMP/jira-agent-claude-messages.json"
-        jq -s 'if length == 1 and (.[0] | type == "array") then .[0] else . end' \
-          "$EXECUTION_FILE" > "$messages_file"
-        jq -er '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false)][-1].result | strings' \
-          "$messages_file" > "$SUMMARY_FILE"
+        printf '%s\n' "$PROMPT" | claude "${args[@]}" > "$EXECUTION_FILE"
+        jq -er 'select(.type == "result" and .subtype == "success" and .is_error == false) | .result | strings' \
+          "$EXECUTION_FILE" > "$SUMMARY_FILE"
         jq -e '
           type == "object" and
           (keys | sort == ["checks", "risks", "summary"]) and
@@ -173,7 +196,7 @@ runs:
           (.risks | type == "array" and all(.[]; type == "string"))
         ' "$SUMMARY_FILE" > /dev/null
 
-        delimiter="claude_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        delimiter="claude_openrouter_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
         {
           echo "structured_output<<$delimiter"
           cat "$SUMMARY_FILE"

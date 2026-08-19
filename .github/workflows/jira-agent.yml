@@ -172,7 +172,6 @@ jobs:
             echo "AWS_CREDENTIAL_EXPIRATION="
             echo "ANTHROPIC_AUTH_TOKEN="
             echo "ANTHROPIC_API_KEY="
-            echo "ANTHROPIC_CUSTOM_HEADERS="
             echo "OPENROUTER_API_KEY="
             echo "CODEX_API_KEY="
           } >> "$GITHUB_ENV"
