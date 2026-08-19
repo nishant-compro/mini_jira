@@ -38,7 +38,7 @@ inputs:
 outputs:
   structured_output:
     description: Agent-neutral JSON summary matching summary.schema.json
-    value: ${{ steps.claude.outputs.structured_output || steps.codex_openrouter.outputs['final-message'] || steps.codex_bedrock.outputs.structured_output }}
+    value: ${{ steps.normalize_claude_openrouter.outputs.structured_output || steps.claude.outputs.structured_output || steps.codex_openrouter.outputs['final-message'] || steps.codex_bedrock.outputs.structured_output }}
   execution_file:
     description: Path to the available execution evidence
     value: ${{ steps.claude.outputs.execution_file || steps.prepare.outputs.execution_file }}
@@ -51,6 +51,8 @@ runs:
       env:
         MODE: ${{ inputs.mode }}
         MODEL: ${{ inputs.model }}
+        MODEL_PROVIDER: ${{ inputs.model-provider }}
+        PROMPT: ${{ inputs.prompt }}
       run: |
         set -euo pipefail
         case "$MODE" in
@@ -73,14 +75,23 @@ runs:
             echo '--allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"'
             echo '--disallowedTools "WebFetch,WebSearch,Bash(gh:*),Bash(git push:*),Bash(git commit:*),Bash(git merge:*),Bash(curl:*),Bash(wget:*)"'
           fi
-          printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
+          if [ "$MODEL_PROVIDER" != openrouter ]; then
+            printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
+          fi
         } > "$args_file"
 
         delimiter="claude_args_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$MODE"
+        prompt_delimiter="claude_prompt_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$MODE"
         {
           echo "claude_args<<$delimiter"
           cat "$args_file"
           echo "$delimiter"
+          echo "claude_prompt<<$prompt_delimiter"
+          printf '%s\n\n' "$PROMPT"
+          echo "Finish with only a JSON object matching this schema, without Markdown fences:"
+          tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json"
+          echo
+          echo "$prompt_delimiter"
           echo "summary_file=$summary_file"
           echo "execution_file=$execution_file"
           if [ "$MODE" = validate ]; then
@@ -132,8 +143,42 @@ runs:
         github_token: ${{ github.token }}
         anthropic_api_key: ${{ inputs.model-provider == 'openrouter' && inputs.openrouter-api-key || '' }}
         use_bedrock: ${{ inputs.model-provider == 'bedrock' && 'true' || 'false' }}
-        prompt: ${{ inputs.prompt }}
+        prompt: ${{ steps.prepare.outputs.claude_prompt }}
         claude_args: ${{ steps.prepare.outputs.claude_args }}
+
+    - name: Normalize Claude OpenRouter result
+      id: normalize_claude_openrouter
+      if: inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter'
+      shell: bash
+      env:
+        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
+      run: |
+        set -euo pipefail
+        if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+          echo "::error::Claude did not provide an execution result"
+          exit 1
+        fi
+
+        messages_file="$RUNNER_TEMP/jira-agent-claude-messages.json"
+        jq -s 'if length == 1 and (.[0] | type == "array") then .[0] else . end' \
+          "$EXECUTION_FILE" > "$messages_file"
+        jq -er '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false)][-1].result | strings' \
+          "$messages_file" > "$SUMMARY_FILE"
+        jq -e '
+          type == "object" and
+          (keys | sort == ["checks", "risks", "summary"]) and
+          (.summary | type == "string" and length > 0) and
+          (.checks | type == "array" and all(.[]; type == "string")) and
+          (.risks | type == "array" and all(.[]; type == "string"))
+        ' "$SUMMARY_FILE" > /dev/null
+
+        delimiter="claude_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        {
+          echo "structured_output<<$delimiter"
+          cat "$SUMMARY_FILE"
+          echo "$delimiter"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Run Codex through OpenRouter
       id: codex_openrouter
