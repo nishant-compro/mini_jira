@@ -1,4 +1,7 @@
 /.scannerwork/
+/.jira-agent/
+/candidate/
+/repair-input/
 /tmp/
 
 # Vite local environment overrides

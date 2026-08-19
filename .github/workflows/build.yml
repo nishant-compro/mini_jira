@@ -6,16 +6,163 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 concurrency:
-  group: sonar-jira-${{ github.ref }}
+  group: build-${{ github.ref }}
   queue: max
+
+permissions:
+  contents: read
+
 jobs:
+  backend-tests:
+    name: Backend RSpec
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
+        with:
+          working-directory: backend
+          bundler-cache: true
+      - name: Run the complete backend test suite
+        working-directory: backend
+        run: |
+          set -o pipefail
+          bundle exec rspec 2>&1 | tee ../backend-rspec.log
+      - name: Upload backend test log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backend-test-logs
+          path: backend-rspec.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  rubocop:
+    name: RuboCop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
+        with:
+          working-directory: backend
+          bundler-cache: true
+      - name: Run RuboCop
+        working-directory: backend
+        run: |
+          set -o pipefail
+          bundle exec rubocop 2>&1 | tee ../rubocop.log
+      - name: Upload RuboCop log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rubocop-logs
+          path: rubocop.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  brakeman:
+    name: Brakeman
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
+        with:
+          working-directory: backend
+          bundler-cache: true
+      - name: Scan Rails application
+        working-directory: backend
+        run: |
+          set -o pipefail
+          bundle exec brakeman --no-pager --ignore-config config/brakeman.ignore --ensure-ignore-notes --ensure-no-obsolete-ignore-entries 2>&1 | tee ../brakeman.log
+      - name: Upload Brakeman log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: brakeman-logs
+          path: brakeman.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  frontend-build:
+    name: Frontend production build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build production bundle
+        working-directory: frontend
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee ../frontend-build.log
+      - name: Upload frontend build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-build-logs
+          path: frontend-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261 # v4.8.2
+        with:
+          fail-on-severity: moderate
+
+  secret-scan:
+    name: Secret scan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan pull request commits for secrets
+        uses: trufflesecurity/trufflehog@96b593f460badf7a3da2ad3487e0e4986243ef03
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --results=verified,unknown
+
   sonarqube:
     name: SonarQube
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          persist-credentials: false
       - name: SonarQube Scan
         id: sonar_scan
         continue-on-error: true
@@ -30,8 +177,8 @@ jobs:
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: ${{ secrets.JIRA_SONAR_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_SONAR_API_TOKEN }}
           SONAR_PROJECT_KEY: personal-poc_mini-jira
           JIRA_PROJECT_KEY: SCRUM
           JIRA_PREFERRED_ISSUE_TYPE: Bug

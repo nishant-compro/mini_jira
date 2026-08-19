@@ -1,0 +1,351 @@
+name: Jira Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: Jira issue key assigned to the AI agent
+        required: true
+        type: string
+      event_id:
+        description: Unique Jira Automation event identifier
+        required: true
+        type: string
+
+concurrency:
+  group: jira-agent-task-queue
+  queue: max
+
+permissions:
+  contents: read
+
+env:
+  RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  admit:
+    name: Validate assignment and assemble context
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      duplicate: ${{ steps.context.outputs.duplicate }}
+      issue_key: ${{ steps.context.outputs.issue_key }}
+      base_sha: ${{ steps.config.outputs.base_sha }}
+      coding_agent: ${{ steps.config.outputs.coding_agent }}
+      model_provider: ${{ steps.config.outputs.model_provider }}
+      implementer_model: ${{ steps.config.outputs.implementer_model }}
+    steps:
+      - name: Check out recorded main commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        id: config
+        shell: bash
+        env:
+          CODING_AGENT: ${{ vars.CODING_AGENT }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_ID: ${{ vars.MODEL_ID }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
+          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Jira dispatches must target main"
+            exit 1
+          fi
+          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_EMAIL JIRA_API_TOKEN PR_BOT_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required Jira agent configuration $name is missing"
+              exit 1
+            fi
+          done
+          ruby .github/scripts/jira-agent/validate_runtime_config.rb
+          echo "base_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and sanitize Jira context
+        id: context
+        env:
+          ISSUE_KEY: ${{ inputs.issue_key }}
+          EVENT_ID: ${{ inputs.event_id }}
+          BASE_SHA: ${{ steps.config.outputs.base_sha }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
+          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CHECK_DUPLICATE: "true"
+          POST_ACCEPTED: "true"
+        run: ruby .github/scripts/jira-agent/fetch_context.rb .jira-agent
+
+      - name: Upload sanitized context
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jira-task-context
+          path: .jira-agent/
+          if-no-files-found: error
+          retention-days: 7
+
+  implement:
+    name: Implement and publish
+    needs: admit
+    if: needs.admit.outputs.duplicate != 'true'
+    runs-on: ubuntu-latest
+    environment: jira-agent-runtime
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      passed: ${{ steps.final.outputs.passed }}
+      branch: ${{ steps.branch.outputs.branch }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.admit.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download task context
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jira-task-context
+          path: .jira-agent
+
+      - name: Prepare backend test dependencies
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
+        with:
+          working-directory: backend
+          bundler-cache: true
+
+      - name: Prepare frontend test runtime
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Stage trusted patch validator outside the model worktree
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jira-agent-verifier"
+          cp .github/scripts/jira-agent/validate_patch.rb "$RUNNER_TEMP/jira-agent-verifier/validate_patch.rb"
+
+      - name: Implement ticket
+        id: agent
+        continue-on-error: true
+        uses: ./.github/actions/run-jira-coding-agent
+        with:
+          coding-agent: ${{ needs.admit.outputs.coding_agent }}
+          model-provider: ${{ needs.admit.outputs.model_provider }}
+          model: ${{ needs.admit.outputs.implementer_model }}
+          mode: implement
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          role-session-name: jira-agent-${{ github.run_id }}
+          prompt: |
+            Implement the sanitized task in .jira-agent/task.md. Follow the shared
+            repository instructions, run every applicable approved check, resolve
+            failures within this invocation, and leave the result uncommitted.
+
+      - name: Clear any model credential residue
+        if: always()
+        run: |
+          {
+            echo "AWS_ACCESS_KEY_ID="
+            echo "AWS_SECRET_ACCESS_KEY="
+            echo "AWS_SESSION_TOKEN="
+            echo "AWS_SECURITY_TOKEN="
+            echo "AWS_CREDENTIAL_EXPIRATION="
+            echo "ANTHROPIC_AUTH_TOKEN="
+            echo "ANTHROPIC_API_KEY="
+            echo "OPENROUTER_API_KEY="
+            echo "CODEX_API_KEY="
+          } >> "$GITHUB_ENV"
+
+      - name: Finalize implementation result and evidence
+        id: final
+        if: always()
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+          IMPLEMENT: ${{ steps.agent.outcome }}
+          AGENT_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          passed=false
+          if [ "$IMPLEMENT" = success ]; then
+            mkdir -p candidate
+            git add --intent-to-add --all
+            if git diff --binary --full-index "$BASE_SHA" -- . > candidate/change.patch; then
+              printf '%s\n' "$AGENT_OUTPUT" > candidate/summary.json
+              if jq -e '
+                   type == "object" and
+                   (.summary | type == "string" and length > 0) and
+                   (.checks | type == "array" and all(.[]; type == "string")) and
+                   (.risks | type == "array" and all(.[]; type == "string"))
+                 ' candidate/summary.json > /dev/null &&
+                 ruby "$RUNNER_TEMP/jira-agent-verifier/validate_patch.rb" --already-applied candidate/change.patch > /dev/null; then
+                passed=true
+              else
+                echo "::error::Agent output or candidate patch failed trusted publication policy"
+              fi
+            fi
+          fi
+
+          if [ "$passed" = true ]; then
+            artifact_name=candidate-ready
+            artifact_path=candidate
+          else
+            artifact_name=implementation-failure-evidence
+            artifact_path=.jira-agent/failure-package
+            mkdir -p "$artifact_path/failure"
+            git add --intent-to-add --all
+            git diff --binary --full-index "$BASE_SHA" -- . > "$artifact_path/failure/change.patch"
+            if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+              cp "$EXECUTION_FILE" "$artifact_path/failure/agent-execution.json"
+            fi
+            if [ -n "$AGENT_OUTPUT" ]; then
+              printf '%s\n' "$AGENT_OUTPUT" > "$artifact_path/failure/summary.json"
+            fi
+          fi
+
+          {
+            echo "passed=$passed"
+            echo "artifact_name=$artifact_name"
+            echo "artifact_path=$artifact_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload candidate or failure evidence
+        if: always() && steps.final.outputs.artifact_path != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.final.outputs.artifact_name }}
+          path: ${{ steps.final.outputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail unsuccessful implementation stage
+        if: always() && steps.final.outputs.passed != 'true'
+        run: |
+          echo "::error::Agent implementation failed or did not produce a safe publishable patch"
+          exit 1
+
+      - name: Commit and push explicit AI branch
+        id: branch
+        if: steps.final.outputs.passed == 'true'
+        env:
+          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          ruby .github/scripts/jira-agent/validate_patch.rb candidate/change.patch > /dev/null
+          if ! git diff --binary --full-index "$BASE_SHA" -- . | cmp --silent candidate/change.patch -; then
+            echo "::error::Working tree no longer matches the approved candidate"
+            exit 1
+          fi
+          branch="ai/$(printf '%s' "$ISSUE_KEY" | tr '[:upper:]' '[:lower:]')-${GITHUB_RUN_ID}"
+          case "$branch" in ai/*) ;; *) echo "::error::Unsafe publication branch"; exit 1 ;; esac
+          git switch --create "$branch" "$BASE_SHA"
+          git config user.name "jira-agent[bot]"
+          git config user.email "jira-agent[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "feat: implement ${ISSUE_KEY}"
+          auth=$(printf 'x-access-token:%s' "$PR_BOT_TOKEN" | base64 -w0)
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open normal pull request and apply labels
+        id: pr
+        if: steps.final.outputs.passed == 'true'
+        env:
+          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          header=(-H "Authorization: Bearer $PR_BOT_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          summary=$(jq -r '.summary // "Implementation generated from the assigned Jira ticket."' candidate/summary.json 2>/dev/null || echo "Implementation generated from the assigned Jira ticket.")
+          checks=$(jq -r 'if (.checks | length) > 0 then .checks | map("- " + .) | join("\n") else "- No checks reported" end' candidate/summary.json)
+          risks=$(jq -r 'if (.risks | length) > 0 then .risks | map("- " + .) | join("\n") else "- None reported" end' candidate/summary.json)
+          body=$(jq -n --arg jira "${JIRA_BASE_URL%/}/browse/${ISSUE_KEY}" --arg run "$RUN_URL" --arg summary "$summary" --arg checks "$checks" --arg risks "$risks" '
+            "Jira: " + $jira + "\n\nActions run: " + $run + "\n\n## Implementation\n" + $summary + "\n\n## Agent-run verification\n" + $checks + "\n\n## Reported risks\n" + $risks + "\n\nThe coding agent performed local checks during implementation. This pull request still requires independent CI and human approval."')
+          payload=$(jq -n --arg title "${ISSUE_KEY}: ${summary:0:180}" --arg head "$BRANCH" --arg body "$body" '{title:$title,head:$head,base:"main",body:$body,draft:false}')
+          response=$(curl --fail-with-body --silent --show-error "${header[@]}" -H "Content-Type: application/json" --data "$payload" "$api/pulls")
+          pr_url=$(printf '%s' "$response" | jq -er .html_url)
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Update Jira with publication links
+        if: steps.final.outputs.passed == 'true'
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          JIRA_COMMENT: "AI branch ${{ steps.branch.outputs.branch }} published as ${{ steps.pr.outputs.pr_url }}. Full CI and human review are pending. Run: ${{ env.RUN_URL }}"
+        run: ruby .github/scripts/jira-agent/comment.rb
+
+  report-failure:
+    name: Notify Jira of workflow failure
+    needs: [admit, implement]
+    if: always() && needs.admit.outputs.duplicate != 'true' && (needs.admit.result != 'success' || needs.implement.result != 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out notification helper
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.admit.outputs.base_sha || github.sha }}
+          persist-credentials: false
+      - name: Notify Jira
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key || inputs.issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          ADMIT_RESULT: ${{ needs.admit.result }}
+          IMPLEMENT_RESULT: ${{ needs.implement.result }}
+          IMPLEMENT_PASSED: ${{ needs.implement.outputs.passed }}
+          BRANCH: ${{ needs.implement.outputs.branch }}
+          PR_URL: ${{ needs.implement.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMIT_RESULT" != success ]; then
+            message="AI workflow admission failed, possibly because Jira or GitHub could not be reached. Implementation was not started. Run: $RUN_URL"
+          elif [ "$IMPLEMENT_PASSED" != true ]; then
+            message="AI implementation failed or did not produce a safe publishable patch. No pull request was created. Model output and the candidate patch are retained on $RUN_URL."
+          elif [ -n "$PR_URL" ]; then
+            message="AI implementation created $PR_URL, but a later publication or Jira update step failed. Check partial publication state before retrying. Run: $RUN_URL"
+          elif [ -n "$BRANCH" ]; then
+            message="AI branch $BRANCH was pushed, but pull-request publication failed. Check partial publication state before retrying. Run: $RUN_URL"
+          else
+            message="AI implementation completed, but publication failed before a branch or pull request was recorded. Run: $RUN_URL"
+          fi
+          export JIRA_COMMENT="$message"
+          for attempt in 1 2 3; do
+            if ruby .github/scripts/jira-agent/comment.rb; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          echo "::error::Unable to notify Jira after three attempts"
+          exit 1

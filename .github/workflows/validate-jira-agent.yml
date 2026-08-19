@@ -1,0 +1,52 @@
+name: Validate Jira Agent Deployment
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: validate-jira-agent-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    name: Validate configured coding agent
+    runs-on: ubuntu-latest
+    environment: jira-agent-runtime
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Validate required configuration
+        id: config
+        env:
+          CODING_AGENT: ${{ vars.CODING_AGENT }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_ID: ${{ vars.MODEL_ID }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: ruby .github/scripts/jira-agent/validate_runtime_config.rb
+
+      - name: Invoke configured agent and provider
+        uses: ./.github/actions/run-jira-coding-agent
+        with:
+          coding-agent: ${{ steps.config.outputs.coding_agent }}
+          model-provider: ${{ steps.config.outputs.model_provider }}
+          model: ${{ steps.config.outputs.implementer_model }}
+          mode: validate
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          role-session-name: jira-deploy-check-${{ github.run_id }}
+          prompt: |
+            Return JSON with summary "Deployment validation succeeded", an empty
+            checks array, and an empty risks array. Do not inspect or edit the
+            repository and do not call tools.
