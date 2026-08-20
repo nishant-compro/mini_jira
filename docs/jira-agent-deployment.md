@@ -5,14 +5,14 @@ The automation uses step-scoped credentials:
 ```text
 Jira assignment -> queued dispatch -> sanitized context -> configured coding agent
   -> implementation and agent-run checks -> agent commit/push/PR
-  -> trusted publication verification -> complete CI
+  -> record publication -> complete CI
   -> human review and merge
 ```
 
 The implementation job exposes Bedrock, OpenRouter, or ChatGPT credentials and the
 scoped PR bot token only to the selected agent invocation. The invocation implements,
 tests, commits, pushes its assigned branch, and creates the pull request. One final
-cleanup clears residual values before trusted post-publication verification.
+cleanup clears residual values after the invocation.
 
 ## End-to-end flow
 
@@ -23,8 +23,8 @@ flowchart LR
   subgraph W1["WORKFLOW · JIRA AGENT"]
     direction LR
     ADMIT["<b>JOB · admit</b><br/>Re-fetch · verify assignee<br/>sanitize · deduplicate"]
-    IMPLEMENT["<b>JOB · implement</b><br/>Agent implement + test + publish<br/>trusted publication verification"]
-    REPORT["<b>JOB · report-failure</b><br/>Retain evidence · notify Jira<br/>report partial publication"]
+    IMPLEMENT["<b>JOB · implement</b><br/>Agent implement + test + publish<br/>record PR · notify Jira"]
+    REPORT["<b>JOB · report-failure</b><br/>Notify Jira<br/>report partial publication"]
 
     ADMIT --> IMPLEMENT
     IMPLEMENT -.->|"still failing"| REPORT
@@ -35,7 +35,7 @@ flowchart LR
   end
 
   HUMAN(["<b>Human review</b><br/>Approve and merge"])
-  STOP(["<b>Automation stopped</b><br/>Jira has artifact link"])
+  STOP(["<b>Automation stopped</b><br/>Jira has Actions run link"])
 
   JIRA -->|"workflow_dispatch"| ADMIT
   IMPLEMENT -->|"published"| CI --> HUMAN
@@ -63,10 +63,10 @@ single invocation implements the ticket, runs every applicable approved check, f
 failures, standardizes the commit and PR metadata, and publishes the PR before
 returning. The workflow does not resume or invoke the model again. Before the agent
 runs, the workflow copies the patch validator outside the editable worktree and
-registers it as a pre-push hook. The hook blocks unsafe patches before publication;
-after the invocation, the trusted verifier checks the patch again and confirms the
-live branch, commit, PR title, and PR body match the structured agent result. It does
-not rerun tests. Build CI then runs independently on the PR, which remains for human review.
+registers it as a pre-push hook. The hook blocks unsafe patches before publication.
+After the invocation, the workflow records the agent-reported PR and adds a visible
+job summary; it does not rerun tests or revalidate the published PR. Build CI then
+runs independently on the PR, which remains for human review.
 All implementation adapters receive `PR_BOT_TOKEN` as `GH_TOKEN`; model-provider
 authentication remains separate.
 
@@ -280,12 +280,10 @@ branch, or push to `main`. Do not enable auto-merge.
 
 The Jira agent must run all applicable approved checks and resolve failures during its
 single implementation invocation. The workflow does not rerun those checks or start a
-repair invocation. A trusted pre-push hook blocks unsafe patches, and bounded
-patches/logs are retained when the agent or trusted post-publication verification
-fails. A PR whose metadata or remote state fails the later check can remain open;
-Jira and the failed Actions run flag it as unsafe to merge. Agent-reported check
-results are advisory until the independent Build workflow passes. Build CI does not
-invoke AI or modify the branch; human review and merge remain mandatory.
+repair invocation. A trusted pre-push hook blocks unsafe patches, and the Actions
+logs remain available when the agent fails. Agent-reported check results are
+advisory until the independent Build workflow passes. Build CI does not invoke AI or
+modify the branch; human review and merge remain mandatory.
 
 ## Rollout checks
 
@@ -296,12 +294,11 @@ Before production assignment, exercise a disposable Jira project and confirm:
 3. Each intended coding-agent/provider pair invokes successfully; the Bedrock role
    cannot invoke models outside its configured allowlist.
 4. Backend-only, frontend-only, shared, empty, binary, symlink, and protected-path
-   candidate patches take the expected post-publication verification path, and failed
-   verification is clearly marked as unsafe to merge.
+   changes take the expected pre-push validation path.
 5. A local test failure is resolved and rerun within the single model invocation;
    neither Claude Code nor Codex is resumed or invoked a second time.
 6. Build CI runs normally on the published PR and never modifies its branch.
-7. Failed local automation retains evidence; successful automation still
+7. Failed local automation retains its Actions logs; successful automation still
    cannot approve, merge, or bypass `main` protection.
 
 All third-party Actions references are immutable commit SHAs. Review upstream release
