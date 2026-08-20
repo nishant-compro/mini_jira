@@ -94,6 +94,7 @@ jobs:
           path: .jira-agent/
           if-no-files-found: error
           retention-days: 7
+          include-hidden-files: true
 
   implement:
     name: Implement and publish
@@ -236,6 +237,7 @@ jobs:
           path: ${{ steps.final.outputs.artifact_path }}
           if-no-files-found: error
           retention-days: 14
+          include-hidden-files: true
 
       - name: Fail unsuccessful implementation stage
         if: always() && steps.final.outputs.passed != 'true'
