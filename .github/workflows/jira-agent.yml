@@ -109,8 +109,8 @@ jobs:
       id-token: write
     outputs:
       passed: ${{ steps.final.outputs.passed }}
-      branch: ${{ steps.branch.outputs.branch }}
-      pr_url: ${{ steps.pr.outputs.pr_url }}
+      branch: ${{ steps.final.outputs.branch }}
+      pr_url: ${{ steps.final.outputs.pr_url }}
     steps:
       - name: Check out trusted base
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -153,10 +153,51 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Stage trusted patch validator outside the model worktree
+        env:
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/jira-agent-verifier"
-          cp .github/scripts/jira-agent/validate_patch.rb "$RUNNER_TEMP/jira-agent-verifier/validate_patch.rb"
+          verifier_dir="$RUNNER_TEMP/jira-agent-verifier"
+          hooks_dir="$verifier_dir/hooks"
+          mkdir -p "$hooks_dir"
+          cp .github/scripts/jira-agent/validate_patch.rb "$verifier_dir/validate_patch.rb"
+          cat > "$hooks_dir/pre-push" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          patch="$verifier_dir/pre-push.patch"
+          git diff --binary --full-index "$BASE_SHA" -- . > "\$patch"
+          ruby "$verifier_dir/validate_patch.rb" --already-applied "\$patch" > /dev/null
+          EOF
+          chmod 700 "$hooks_dir/pre-push"
+          git config core.hooksPath "$hooks_dir"
+
+      - name: Prepare trusted publication contract
+        id: publication
+        shell: bash
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          branch="ai/$(printf '%s' "$ISSUE_KEY" | tr '[:upper:]' '[:lower:]')-${GITHUB_RUN_ID}"
+          jira_url="${JIRA_BASE_URL%/}/browse/${ISSUE_KEY}"
+          jq -n \
+            --arg issue_key "$ISSUE_KEY" \
+            --arg branch "$branch" \
+            --arg base_branch "main" \
+            --arg base_sha "$BASE_SHA" \
+            --arg jira_url "$jira_url" \
+            --arg run_url "$RUN_URL" \
+            '{
+              issue_key: $issue_key,
+              branch: $branch,
+              base_branch: $base_branch,
+              base_sha: $base_sha,
+              jira_url: $jira_url,
+              run_url: $run_url
+            }' > .jira-agent/publication.json
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
       - name: Implement ticket
         id: agent
@@ -171,11 +212,9 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           codex-auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+          github-token: ${{ secrets.PR_BOT_TOKEN }}
           role-session-name: jira-agent-${{ github.run_id }}
-          prompt: |
-            Implement the sanitized task in .jira-agent/task.md. Follow the shared
-            repository instructions, run every applicable approved check, resolve
-            failures within this invocation, and leave the result uncommitted.
+          prompt: Implement the Jira ticket described in .jira-agent/task.md.
 
       - name: Clear any model credential residue
         if: always()
@@ -191,6 +230,7 @@ jobs:
             echo "OPENROUTER_API_KEY="
             echo "CODEX_API_KEY="
             echo "CODEX_AUTH_JSON="
+            echo "GH_TOKEN="
           } >> "$GITHUB_ENV"
 
       - name: Finalize implementation result and evidence
@@ -202,24 +242,68 @@ jobs:
           IMPLEMENT: ${{ steps.agent.outcome }}
           AGENT_OUTPUT: ${{ steps.agent.outputs.structured_output }}
           EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          EXPECTED_BRANCH: ${{ steps.publication.outputs.branch }}
+          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
         run: |
           set -euo pipefail
           passed=false
+          published_branch=""
+          published_pr_url=""
+          publication_json=""
+
+          if publication_json=$(GH_TOKEN="$PR_BOT_TOKEN" gh pr view "$EXPECTED_BRANCH" \
+               --repo "$GITHUB_REPOSITORY" \
+               --json title,body,headRefName,headRefOid,baseRefName,isDraft,state,url 2>/dev/null); then
+            published_branch=$(printf '%s' "$publication_json" | jq -r '.headRefName // empty')
+            published_pr_url=$(printf '%s' "$publication_json" | jq -r '.url // empty')
+          fi
+
           if [ "$IMPLEMENT" = success ]; then
             mkdir -p candidate
             git add --intent-to-add --all
             if git diff --binary --full-index "$BASE_SHA" -- . > candidate/change.patch; then
               printf '%s\n' "$AGENT_OUTPUT" > candidate/summary.json
-              if jq -e '
+              if jq -e \
+                 --arg issue "$ISSUE_KEY" \
+                 --arg branch "$EXPECTED_BRANCH" \
+                 --arg repo "$GITHUB_REPOSITORY" \
+                 --arg jira "${JIRA_BASE_URL%/}/browse/${ISSUE_KEY}" \
+                 --arg run "$RUN_URL" '
                    type == "object" and
-                   (.summary | type == "string" and length > 0) and
-                   (.checks | type == "array" and all(.[]; type == "string")) and
-                   (.risks | type == "array" and all(.[]; type == "string"))
+                   (keys | sort == ["branch", "checks", "commit_message", "pr_body", "pr_title", "pr_url", "risks", "summary"]) and
+                   (.summary | type == "string" and length > 0 and length <= 500) and
+                   (.checks | type == "array" and all(.[]; type == "string" and length <= 240)) and
+                   (.risks | type == "array" and all(.[]; type == "string" and length <= 240)) and
+                   (.commit_message == .pr_title) and
+                   (.pr_title | type == "string" and length <= 72 and startswith($issue + ": ") and (test("[`\\[\\]\\r\\n]") | not)) and
+                   (.pr_body | type == "string" and length <= 1600 and startswith("## Summary\\n") and contains("\\n## Validation\\n") and contains("\\n## Risks\\n") and contains($jira) and contains($run)) and
+                   (.branch == $branch) and
+                   (.pr_url | type == "string" and startswith("https://github.com/" + $repo + "/pull/") and (split("/") | last | test("^[1-9][0-9]*$")))
                  ' candidate/summary.json > /dev/null &&
-                 ruby "$RUNNER_TEMP/jira-agent-verifier/validate_patch.rb" --already-applied candidate/change.patch > /dev/null; then
+                 ruby "$RUNNER_TEMP/jira-agent-verifier/validate_patch.rb" --already-applied candidate/change.patch > /dev/null &&
+                 [ "$(git branch --show-current)" = "$EXPECTED_BRANCH" ] &&
+                 [ "$(git rev-list --count "$BASE_SHA"..HEAD)" = 1 ] &&
+                 [ "$(git log -1 --pretty=%s)" = "$(jq -r .commit_message candidate/summary.json)" ] &&
+                 [ -n "$publication_json" ] &&
+                 printf '%s' "$publication_json" | jq -e \
+                   --arg local_head "$(git rev-parse HEAD)" \
+                   --slurpfile expected candidate/summary.json '
+                     .title == $expected[0].pr_title and
+                     .body == $expected[0].pr_body and
+                     .headRefName == $expected[0].branch and
+                     .headRefOid == $local_head and
+                     .baseRefName == "main" and
+                     .isDraft == false and
+                     .state == "OPEN" and
+                     .url == $expected[0].pr_url
+                   ' > /dev/null; then
+                published_branch=$(jq -r .branch candidate/summary.json)
+                published_pr_url=$(jq -r .pr_url candidate/summary.json)
                 passed=true
               else
-                echo "::error::Agent output or candidate patch failed trusted publication policy"
+                echo "::error::Agent publication, output, or candidate patch failed trusted policy"
               fi
             fi
           fi
@@ -245,6 +329,8 @@ jobs:
             echo "passed=$passed"
             echo "artifact_name=$artifact_name"
             echo "artifact_path=$artifact_path"
+            echo "branch=$published_branch"
+            echo "pr_url=$published_pr_url"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload candidate or failure evidence
@@ -263,60 +349,13 @@ jobs:
           echo "::error::Agent implementation failed or did not produce a safe publishable patch"
           exit 1
 
-      - name: Commit and push explicit AI branch
-        id: branch
-        if: steps.final.outputs.passed == 'true'
-        env:
-          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
-          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
-          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
-        run: |
-          set -euo pipefail
-          ruby .github/scripts/jira-agent/validate_patch.rb --already-applied candidate/change.patch > /dev/null
-          if ! git diff --binary --full-index "$BASE_SHA" -- . | cmp --silent candidate/change.patch -; then
-            echo "::error::Working tree no longer matches the approved candidate"
-            exit 1
-          fi
-          branch="ai/$(printf '%s' "$ISSUE_KEY" | tr '[:upper:]' '[:lower:]')-${GITHUB_RUN_ID}"
-          case "$branch" in ai/*) ;; *) echo "::error::Unsafe publication branch"; exit 1 ;; esac
-          git switch --create "$branch" "$BASE_SHA"
-          git config user.name "jira-agent[bot]"
-          git config user.email "jira-agent[bot]@users.noreply.github.com"
-          git add --all
-          git commit -m "feat: implement ${ISSUE_KEY}"
-          auth=$(printf 'x-access-token:%s' "$PR_BOT_TOKEN" | base64 -w0)
-          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$branch"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-      - name: Open normal pull request and apply labels
-        id: pr
-        if: steps.final.outputs.passed == 'true'
-        env:
-          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
-          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
-          BRANCH: ${{ steps.branch.outputs.branch }}
-          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
-        run: |
-          set -euo pipefail
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-          header=(-H "Authorization: Bearer $PR_BOT_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
-          summary=$(jq -r '.summary // "Implementation generated from the assigned Jira ticket."' candidate/summary.json 2>/dev/null || echo "Implementation generated from the assigned Jira ticket.")
-          checks=$(jq -r 'if (.checks | length) > 0 then .checks | map("- " + .) | join("\n") else "- No checks reported" end' candidate/summary.json)
-          risks=$(jq -r 'if (.risks | length) > 0 then .risks | map("- " + .) | join("\n") else "- None reported" end' candidate/summary.json)
-          body=$(jq -n --arg jira "${JIRA_BASE_URL%/}/browse/${ISSUE_KEY}" --arg run "$RUN_URL" --arg summary "$summary" --arg checks "$checks" --arg risks "$risks" '
-            "Jira: " + $jira + "\n\nActions run: " + $run + "\n\n## Implementation\n" + $summary + "\n\n## Agent-run verification\n" + $checks + "\n\n## Reported risks\n" + $risks + "\n\nThe coding agent performed local checks during implementation. This pull request still requires independent CI and human approval."')
-          payload=$(jq -n --arg title "${ISSUE_KEY}: ${summary:0:180}" --arg head "$BRANCH" --arg body "$body" '{title:$title,head:$head,base:"main",body:$body,draft:false}')
-          response=$(curl --fail-with-body --silent --show-error "${header[@]}" -H "Content-Type: application/json" --data "$payload" "$api/pulls")
-          pr_url=$(printf '%s' "$response" | jq -er .html_url)
-          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-
       - name: Update Jira with publication links
         if: steps.final.outputs.passed == 'true'
         env:
           ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
-          JIRA_COMMENT: "AI branch ${{ steps.branch.outputs.branch }} published as ${{ steps.pr.outputs.pr_url }}. Full CI and human review are pending. Run: ${{ env.RUN_URL }}"
+          JIRA_COMMENT: "AI branch ${{ steps.final.outputs.branch }} published as ${{ steps.final.outputs.pr_url }}. Full CI and human review are pending. Run: ${{ env.RUN_URL }}"
         run: ruby .github/scripts/jira-agent/comment.rb
 
   report-failure:
@@ -345,14 +384,14 @@ jobs:
           set -euo pipefail
           if [ "$ADMIT_RESULT" != success ]; then
             message="AI workflow admission failed, possibly because Jira or GitHub could not be reached. Implementation was not started. Run: $RUN_URL"
-          elif [ "$IMPLEMENT_PASSED" != true ]; then
-            message="AI implementation failed or did not produce a safe publishable patch. No pull request was created. Model output and the candidate patch are retained on $RUN_URL."
           elif [ -n "$PR_URL" ]; then
-            message="AI implementation created $PR_URL, but a later publication or Jira update step failed. Check partial publication state before retrying. Run: $RUN_URL"
+            message="AI implementation created $PR_URL, but trusted post-publication validation or a later step failed. Do not merge until the failed run is reviewed. Run: $RUN_URL"
           elif [ -n "$BRANCH" ]; then
-            message="AI branch $BRANCH was pushed, but pull-request publication failed. Check partial publication state before retrying. Run: $RUN_URL"
+            message="AI branch $BRANCH was pushed, but pull-request creation or a later step failed. Check partial publication state before retrying. Run: $RUN_URL"
+          elif [ "$IMPLEMENT_PASSED" != true ]; then
+            message="AI implementation failed before publishing a pull request. Model output and the candidate patch are retained on $RUN_URL."
           else
-            message="AI implementation completed, but publication failed before a branch or pull request was recorded. Run: $RUN_URL"
+            message="AI implementation completed, but no branch or pull request was recorded. Run: $RUN_URL"
           fi
           export JIRA_COMMENT="$message"
           for attempt in 1 2 3; do

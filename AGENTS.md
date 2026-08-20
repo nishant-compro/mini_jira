@@ -12,10 +12,8 @@ For Jira ticket implementation:
 - Add or update focused tests for behavior changes.
 - Do not modify `.github/**`, `.agents/**`, `.claude/**`, `AGENTS.md`, `CLAUDE.md`,
   credentials, secret-bearing files, or repository security configuration.
-- Do not use network access except the approved `npm ci` command. Do not use GitHub
-  APIs, `git push`, merge commands, or secret stores.
-- Leave changes uncommitted. The automation publisher creates branches and pull
-  requests.
+- Use only the network and publication operations expressly authorized by the Jira
+  skill. Never print or inspect credentials or access secret stores.
 
 Approved checks are:
 

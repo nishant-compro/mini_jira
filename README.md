@@ -39,9 +39,9 @@ The repository includes an opt-in Jira assignment pipeline with a configurable
 coding agent (`claude-code` or `codex`) and model provider (`bedrock` or
 `openrouter`). Jira dispatches only the issue key and an idempotency event ID;
 GitHub re-fetches and sanitizes the issue before any model is invoked. Generated
-changes receive agent-run local checks, a trusted patch-safety check, and normal
-pull-request CI, then remain for human review. Automation never approves, merges, or
-pushes to `main`.
+changes receive agent-run local checks, agent-owned PR publication, trusted
+post-publication verification, and normal pull-request CI, then remain for human
+review. Automation never approves, merges, or pushes to `main`.
 
 See [the workflow overview](docs/jira-agent-workflow-overview.md) for the end-to-end
 flow, and [the deployment guide](docs/jira-agent-deployment.md) for Jira, GitHub, AWS

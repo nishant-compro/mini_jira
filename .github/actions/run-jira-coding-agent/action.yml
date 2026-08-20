@@ -34,6 +34,10 @@ inputs:
     description: File-backed Codex ChatGPT authentication cache
     required: false
     default: ""
+  github-token:
+    description: GitHub token exposed only to implementation runs for agent-owned PR publication
+    required: false
+    default: ""
   role-session-name:
     description: AWS role session name
     required: false
@@ -55,16 +59,23 @@ runs:
       env:
         MODE: ${{ inputs.mode }}
         MODEL: ${{ inputs.model }}
+        PUBLICATION_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         case "$MODE" in
           implement|validate) ;;
           *) echo "::error::Unsupported invocation mode"; exit 1 ;;
         esac
+        if [ "$MODE" = implement ] && [ -z "$PUBLICATION_TOKEN" ]; then
+          echo "::error::Implementation mode requires a GitHub publication token"
+          exit 1
+        fi
 
         summary_file="$RUNNER_TEMP/jira-agent-$MODE-summary.json"
         execution_file="$RUNNER_TEMP/jira-agent-$MODE-execution.jsonl"
         args_file="$RUNNER_TEMP/jira-agent-$MODE-claude-args"
+        codex_home="$RUNNER_TEMP/jira-agent-$MODE-codex-home"
+        mkdir -p "$codex_home"
         {
           printf -- '--model "%s"\n' "$MODEL"
           if [ "$MODE" = validate ]; then
@@ -74,8 +85,8 @@ runs:
           else
             echo '--max-turns 25'
             echo '--max-budget-usd 10'
-            echo '--allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"'
-            echo '--disallowedTools "WebFetch,WebSearch,Bash(gh:*),Bash(git push:*),Bash(git commit:*),Bash(git merge:*),Bash(curl:*),Bash(wget:*)"'
+            echo '--allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(git add:*),Bash(git switch:*),Bash(git config:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*),Bash(gh auth setup-git),Bash(gh pr create:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"'
+            echo '--disallowedTools "WebFetch,WebSearch,Bash(git merge:*),Bash(curl:*),Bash(wget:*)"'
           fi
           printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
         } > "$args_file"
@@ -87,16 +98,29 @@ runs:
           echo "$delimiter"
           echo "summary_file=$summary_file"
           echo "execution_file=$execution_file"
+          echo "codex_home=$codex_home"
           if [ "$MODE" = validate ]; then
             echo "codex_permission=:read-only"
             echo "codex_chatgpt_permission=:read-only"
-            echo "codex_sandbox=read-only"
           else
-            echo "codex_permission=:workspace"
-            echo "codex_chatgpt_permission=:danger-full-access"
-            echo "codex_sandbox=workspace-write"
+            echo "codex_permission=jira-publisher"
+            echo "codex_chatgpt_permission=jira-publisher"
           fi
         } >> "$GITHUB_OUTPUT"
+
+        if [ "$MODE" = implement ]; then
+          cat > "$codex_home/config.toml" <<'EOF'
+        [permissions.jira-publisher]
+        extends = ":workspace"
+
+        [permissions.jira-publisher.network]
+        enabled = true
+
+        [permissions.jira-publisher.network.domains]
+        "github.com" = "allow"
+        "api.github.com" = "allow"
+        EOF
+        fi
 
     - name: Prepare Node.js for direct coding agent
       if: (inputs.coding-agent == 'codex' && (inputs.model-provider == 'bedrock' || inputs.model-provider == 'chatgpt')) || (inputs.coding-agent == 'claude-code' && inputs.model-provider == 'openrouter')
@@ -141,8 +165,9 @@ runs:
         AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
         AWS_REGION: ${{ inputs.aws-region }}
         AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+        GH_TOKEN: ${{ inputs.github-token }}
       with:
-        github_token: ${{ github.token }}
+        github_token: ${{ inputs.github-token || github.token }}
         use_bedrock: "true"
         prompt: ${{ inputs.prompt }}
         claude_args: ${{ steps.prepare.outputs.claude_args }}
@@ -163,6 +188,7 @@ runs:
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
         SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         args=(
@@ -180,9 +206,9 @@ runs:
             --max-budget-usd 10
             --permission-mode dontAsk
             --allowedTools
-            "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"
+            "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(git add:*),Bash(git switch:*),Bash(git config:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*),Bash(gh auth setup-git),Bash(gh pr create:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"
             --disallowedTools
-            "WebFetch,WebSearch,Bash(gh:*),Bash(git push:*),Bash(git commit:*),Bash(git merge:*),Bash(curl:*),Bash(wget:*)"
+            "WebFetch,WebSearch,Bash(git merge:*),Bash(curl:*),Bash(wget:*)"
           )
         fi
 
@@ -207,10 +233,12 @@ runs:
           "$EXECUTION_FILE" > "$SUMMARY_FILE"
         jq -e '
           type == "object" and
-          (keys | sort == ["checks", "risks", "summary"]) and
+          ((keys - ["summary", "checks", "risks", "commit_message", "pr_title", "pr_body", "branch", "pr_url"]) | length == 0) and
           (.summary | type == "string" and length > 0) and
           (.checks | type == "array" and all(.[]; type == "string")) and
-          (.risks | type == "array" and all(.[]; type == "string"))
+          (.risks | type == "array" and all(.[]; type == "string")) and
+          (env.MODE != "implement" or
+            ([.commit_message, .pr_title, .pr_body, .branch, .pr_url] | all(.[]; type == "string" and length > 0)))
         ' "$SUMMARY_FILE" > /dev/null
 
         delimiter="claude_openrouter_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
@@ -227,6 +255,7 @@ runs:
       env:
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
         ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        GH_TOKEN: ${{ inputs.github-token }}
       with:
         openai-api-key: ${{ inputs.openrouter-api-key }}
         responses-api-endpoint: https://openrouter.ai/api/v1/responses
@@ -236,6 +265,7 @@ runs:
         model: ${{ inputs.model }}
         codex-version: 0.147.0
         permission-profile: ${{ steps.prepare.outputs.codex_permission }}
+        codex-home: ${{ steps.prepare.outputs.codex_home }}
         safety-strategy: drop-sudo
 
     - name: Run Codex with ChatGPT authentication
@@ -246,13 +276,14 @@ runs:
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
         ACTIONS_ID_TOKEN_REQUEST_URL: ""
         CODEX_AUTH_JSON: ${{ inputs.codex-auth-json }}
-        CODEX_HOME: ${{ runner.temp }}/jira-agent-chatgpt-codex-home
+        CODEX_HOME: ${{ steps.prepare.outputs.codex_home }}
         MODEL: ${{ inputs.model }}
         PROMPT: ${{ inputs.prompt }}
         PERMISSION: ${{ steps.prepare.outputs.codex_chatgpt_permission }}
         SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         umask 077
@@ -295,7 +326,7 @@ runs:
       if: always() && inputs.coding-agent == 'codex' && inputs.model-provider == 'chatgpt'
       shell: bash
       run: |
-        auth_file="${{ runner.temp }}/jira-agent-chatgpt-codex-home/auth.json"
+        auth_file="${{ steps.prepare.outputs.codex_home }}/auth.json"
         if [ -f "$auth_file" ]; then
           rm -f -- "$auth_file"
         fi
@@ -312,20 +343,21 @@ runs:
         AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
         AWS_REGION: ${{ inputs.aws-region }}
         AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
-        CODEX_HOME: ${{ runner.temp }}/jira-agent-codex-home
+        CODEX_HOME: ${{ steps.prepare.outputs.codex_home }}
         MODEL: ${{ inputs.model }}
         PROMPT: ${{ inputs.prompt }}
-        SANDBOX: ${{ steps.prepare.outputs.codex_sandbox }}
+        PERMISSION: ${{ steps.prepare.outputs.codex_permission }}
         SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         mkdir -p "$CODEX_HOME"
         printf '%s\n' "$PROMPT" | codex \
           -c 'model_provider="amazon-bedrock"' \
           -c 'approval_policy="never"' \
-          -c "sandbox_mode=\"$SANDBOX\"" \
+          -c "default_permissions=\"$PERMISSION\"" \
           -c 'shell_environment_policy.exclude=["AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN","ACTIONS_ID_TOKEN_REQUEST_TOKEN","ACTIONS_ID_TOKEN_REQUEST_URL"]' \
           exec \
           --strict-config \

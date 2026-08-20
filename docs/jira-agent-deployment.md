@@ -4,16 +4,15 @@ The automation uses step-scoped credentials:
 
 ```text
 Jira assignment -> queued dispatch -> sanitized context -> configured coding agent
-  -> implementation and agent-run checks -> trusted patch-safety gate
-  -> bot-only PR publication -> complete CI
+  -> implementation and agent-run checks -> agent commit/push/PR
+  -> trusted publication verification -> complete CI
   -> human review and merge
 ```
 
-The implementation job exposes Bedrock, OpenRouter, or ChatGPT credentials only to the
-selected agent invocation, which includes the agent-run tests and verification. One final
-cleanup clears residual values before the trusted patch-safety and publication steps.
-Publication credentials are added only after that cleanup, but implementation and
-publication share a runner and therefore do not have a job-level process boundary.
+The implementation job exposes Bedrock, OpenRouter, or ChatGPT credentials and the
+scoped PR bot token only to the selected agent invocation. The invocation implements,
+tests, commits, pushes its assigned branch, and creates the pull request. One final
+cleanup clears residual values before trusted post-publication verification.
 
 ## End-to-end flow
 
@@ -24,7 +23,7 @@ flowchart LR
   subgraph W1["WORKFLOW · JIRA AGENT"]
     direction LR
     ADMIT["<b>JOB · admit</b><br/>Re-fetch · verify assignee<br/>sanitize · deduplicate"]
-    IMPLEMENT["<b>JOB · implement</b><br/>Agent implement + test<br/>patch safety → publish"]
+    IMPLEMENT["<b>JOB · implement</b><br/>Agent implement + test + publish<br/>trusted publication verification"]
     REPORT["<b>JOB · report-failure</b><br/>Retain evidence · notify Jira<br/>report partial publication"]
 
     ADMIT --> IMPLEMENT
@@ -60,15 +59,15 @@ flowchart LR
 ```
 
 Claude Code or Codex runs on GitHub runners with the configured model provider. A
-single invocation implements the ticket, runs every applicable approved
-check, fixes failures, and reruns failed checks before returning. The workflow does
-not resume or invoke the model again. Before the agent runs, the workflow copies the
-patch validator outside the editable worktree. After the invocation, that trusted
-copy validates publication policy only; it does not rerun tests. Build CI then runs
-independently on a published pull request, which remains unchanged for human review.
-The Bedrock Claude Code Action receives the job's read-only `github.token` for its own
-GitHub authentication, so it does not require installation of the Claude GitHub App.
-The direct OpenRouter CLI path does not authenticate to GitHub. Model-provider
+single invocation implements the ticket, runs every applicable approved check, fixes
+failures, standardizes the commit and PR metadata, and publishes the PR before
+returning. The workflow does not resume or invoke the model again. Before the agent
+runs, the workflow copies the patch validator outside the editable worktree and
+registers it as a pre-push hook. The hook blocks unsafe patches before publication;
+after the invocation, the trusted verifier checks the patch again and confirms the
+live branch, commit, PR title, and PR body match the structured agent result. It does
+not rerun tests. Build CI then runs independently on the PR, which remains for human review.
+All implementation adapters receive `PR_BOT_TOKEN` as `GH_TOKEN`; model-provider
 authentication remains separate.
 
 ## Deployment setup
@@ -126,7 +125,7 @@ authentication remains separate.
    | Secret | Purpose |
    | --- | --- |
    | `JIRA_AGENT_API_TOKEN` | Scoped Jira service-account token |
-   | `PR_BOT_TOKEN` | Publish the branch and pull request |
+   | `PR_BOT_TOKEN` | Let the agent push its assigned branch and create its pull request |
    | `OPENROUTER_API_KEY` | Required for OpenRouter only |
    | `CODEX_AUTH_JSON` | Required for Codex with ChatGPT only |
 
@@ -281,10 +280,12 @@ branch, or push to `main`. Do not enable auto-merge.
 
 The Jira agent must run all applicable approved checks and resolve failures during its
 single implementation invocation. The workflow does not rerun those checks or start a
-repair invocation. If the agent fails or its patch violates publication policy, no PR
-is created and bounded patches/logs are retained as Actions artifacts. Agent-reported
-check results are advisory until the independent Build workflow passes. Build CI does
-not invoke AI or modify the branch; human review and merge remain mandatory.
+repair invocation. A trusted pre-push hook blocks unsafe patches, and bounded
+patches/logs are retained when the agent or trusted post-publication verification
+fails. A PR whose metadata or remote state fails the later check can remain open;
+Jira and the failed Actions run flag it as unsafe to merge. Agent-reported check
+results are advisory until the independent Build workflow passes. Build CI does not
+invoke AI or modify the branch; human review and merge remain mandatory.
 
 ## Rollout checks
 
@@ -295,7 +296,8 @@ Before production assignment, exercise a disposable Jira project and confirm:
 3. Each intended coding-agent/provider pair invokes successfully; the Bedrock role
    cannot invoke models outside its configured allowlist.
 4. Backend-only, frontend-only, shared, empty, binary, symlink, and protected-path
-   candidate patches take the expected publication-safety path.
+   candidate patches take the expected post-publication verification path, and failed
+   verification is clearly marked as unsafe to merge.
 5. A local test failure is resolved and rerun within the single model invocation;
    neither Claude Code nor Codex is resumed or invoked a second time.
 6. Build CI runs normally on the published PR and never modifies its branch.
