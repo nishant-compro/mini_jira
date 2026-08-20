@@ -214,7 +214,7 @@ runs:
         delimiter="claude_openrouter_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
         {
           echo "structured_output<<$delimiter"
-          cat "$SUMMARY_FILE"
+          jq -c . "$SUMMARY_FILE"
           echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
 
@@ -281,7 +281,7 @@ runs:
         delimiter="codex_chatgpt_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
         {
           echo "structured_output<<$delimiter"
-          cat "$SUMMARY_FILE"
+          jq -c . "$SUMMARY_FILE"
           echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
 
@@ -332,6 +332,6 @@ runs:
         delimiter="codex_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
         {
           echo "structured_output<<$delimiter"
-          cat "$SUMMARY_FILE"
+          jq -c . "$SUMMARY_FILE"
           echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
