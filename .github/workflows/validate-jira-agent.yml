@@ -33,6 +33,7 @@ jobs:
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: ruby .github/scripts/jira-agent/validate_runtime_config.rb
 
       - name: Invoke configured agent and provider
@@ -45,6 +46,7 @@ jobs:
           aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          codex-auth-json: ${{ secrets.CODEX_AUTH_JSON }}
           role-session-name: jira-deploy-check-${{ github.run_id }}
           prompt: |
             Return JSON with summary "Deployment validation succeeded", an empty

@@ -12,6 +12,7 @@ frontend/node_modules/
 frontend/dist/
 
 backend/.bundle/
+backend/vendor/bundle/
 backend/log/*
 backend/tmp/*
 backend/storage/*

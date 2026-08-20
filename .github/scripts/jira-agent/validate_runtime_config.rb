@@ -1,8 +1,10 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "json"
+
 ALLOWED_AGENTS = %w[claude-code codex].freeze
-ALLOWED_PROVIDERS = %w[bedrock openrouter].freeze
+ALLOWED_PROVIDERS = %w[bedrock chatgpt openrouter].freeze
 SAFE_MODEL = /\A[A-Za-z0-9~][A-Za-z0-9._:\/@~-]{0,511}\z/
 
 def fail_config(message)
@@ -30,6 +32,19 @@ when "bedrock"
   required("AWS_REGION")
 when "openrouter"
   required("OPENROUTER_API_KEY")
+when "chatgpt"
+  fail_config("ChatGPT authentication is only supported with Codex") unless agent == "codex"
+
+  begin
+    auth = JSON.parse(required("CODEX_AUTH_JSON"))
+  rescue JSON::ParserError
+    fail_config("CODEX_AUTH_JSON is not valid JSON")
+  end
+
+  refresh_token = auth.is_a?(Hash) && auth.dig("tokens", "refresh_token")
+  unless auth.is_a?(Hash) && auth["auth_mode"] == "chatgpt" && refresh_token.is_a?(String) && !refresh_token.empty?
+    fail_config("CODEX_AUTH_JSON must contain ChatGPT auth with a refresh token")
+  end
 end
 
 if (output = ENV["GITHUB_OUTPUT"]) && !output.empty?
