@@ -123,6 +123,21 @@ jobs:
           name: jira-task-context
           path: .jira-agent
 
+      - name: Print final sanitized agent context
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in .jira-agent/task.md .jira-agent/metadata.json; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected agent context file $file is missing"
+              exit 1
+            fi
+            echo "::group::$file"
+            sed -n '1,$p' "$file"
+            echo "::endgroup::"
+          done
+
       - name: Prepare backend test dependencies
         uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
         with:
