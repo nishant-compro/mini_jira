@@ -130,7 +130,7 @@ const TicketDetail = {
 		comments.value = comments.value.map(comment => ({ ...comment, draft: comment.body }))
 		async function addComment() {
 			try { const result = await request(`/projects/${props.data.project.id}/tickets/${props.data.ticket.id}/comments`, "POST", { comment: { body: newComment.value } }); comments.value.push(result.comment); newComment.value = "" }
-			catch (failure) { error.value = failure.errors?.join(", ") || "Unable to add comment" }
+			catch (error_) { error.value = error_.errors?.join(", ") || "Unable to add comment" }
 		}
 		async function deleteComment(comment) { await request(`/projects/${props.data.project.id}/tickets/${props.data.ticket.id}/comments/${comment.id}`, "DELETE"); comments.value = comments.value.filter(item => item.id !== comment.id) }
 		async function updateComment(comment, event) { const result = await request(`/projects/${props.data.project.id}/tickets/${props.data.ticket.id}/comments/${comment.id}`, "PATCH", { comment: { body: comment.draft } }); comment.body = result.comment.body; event.target.closest("details").open = false }
