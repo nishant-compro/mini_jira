@@ -265,12 +265,14 @@ runs:
           (.tokens.refresh_token | type == "string" and length > 0)
         ' "$CODEX_HOME/auth.json" > /dev/null
 
-        # GitHub-hosted runners can reject bubblewrap's loopback setup.
+        # GitHub-hosted runners can reject bubblewrap's isolated loopback setup.
         printf '%s\n' "$PROMPT" | codex \
           -c 'forced_login_method="chatgpt"' \
           -c 'approval_policy="never"' \
           -c "sandbox_mode=\"$SANDBOX\"" \
-          -c 'use_legacy_landlock=true' \
+          -c 'sandbox_workspace_write.network_access=true' \
+          -c 'features.apps=false' \
+          -c 'features.plugins=false' \
           -c 'shell_environment_policy.exclude=["ACTIONS_ID_TOKEN_REQUEST_TOKEN","ACTIONS_ID_TOKEN_REQUEST_URL","CODEX_API_KEY","CODEX_AUTH_JSON","OPENAI_API_KEY"]' \
           exec \
           --strict-config \
