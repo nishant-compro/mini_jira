@@ -272,7 +272,7 @@ jobs:
           BASE_SHA: ${{ needs.admit.outputs.base_sha }}
         run: |
           set -euo pipefail
-          ruby .github/scripts/jira-agent/validate_patch.rb candidate/change.patch > /dev/null
+          ruby .github/scripts/jira-agent/validate_patch.rb --already-applied candidate/change.patch > /dev/null
           if ! git diff --binary --full-index "$BASE_SHA" -- . | cmp --silent candidate/change.patch -; then
             echo "::error::Working tree no longer matches the approved candidate"
             exit 1
