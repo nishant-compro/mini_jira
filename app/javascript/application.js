@@ -26,6 +26,10 @@ function avatar(user, accent = false) {
 	return user ? user.initials : "?"
 }
 
+function statusLabel(status) {
+	return { todo: "To do", in_progress: "In progress", done: "Done" }[status] || status
+}
+
 const ProjectIndex = {
 	props: ["data"],
 	setup(props) {
@@ -135,7 +139,6 @@ const TicketDetail = {
 		async function deleteComment(comment) { await request(`/projects/${props.data.project.id}/tickets/${props.data.ticket.id}/comments/${comment.id}`, "DELETE"); comments.value = comments.value.filter(item => item.id !== comment.id) }
 		async function updateComment(comment, event) { const result = await request(`/projects/${props.data.project.id}/tickets/${props.data.ticket.id}/comments/${comment.id}`, "PATCH", { comment: { body: comment.draft } }); comment.body = result.comment.body; event.target.closest("details").open = false }
 		async function deleteTicket() { if (window.confirm("Delete this ticket?")) { const result = await request(props.data.ticket.url, "DELETE"); window.location.href = result.redirect_url } }
-		function statusLabel(status) { return { todo: "To do", in_progress: "In progress", done: "Done" }[status] || status }
 		return { comments, newComment, error, addComment, deleteComment, updateComment, deleteTicket, avatar, statusLabel }
 	},
 	template: `<main class="page page--narrow"><a data-turbo="false" :href="'/projects/' + data.project.id" class="back-link">← {{ data.project.name }}</a><div class="content-card"><div class="ticket-detail__header"><h1 class="ticket-detail__title">{{ data.ticket.title }}</h1><div class="ticket-detail__actions"><span class="badge" :class="'badge--status-' + data.ticket.status">{{ statusLabel(data.ticket.status) }}</span><a data-turbo="false" :href="data.ticket.edit_url" class="btn btn--small">Edit</a><button @click="deleteTicket" class="btn btn--small btn--danger">Delete</button></div></div><div class="ticket-detail__meta"><span class="meta-item">◎ Reported by {{ data.ticket.reporter?.name || 'Unknown' }}</span><span class="meta-item">◎ Assigned to {{ data.ticket.assignee?.name || 'Unassigned' }}</span></div><hr class="divider"><p class="ticket-detail__description">{{ data.ticket.description }}</p><hr class="divider"><div class="comments-label">Comments · {{ comments.length }}</div><div class="stack stack--comments"><div v-for="comment in comments" :key="comment.id" class="comment"><span class="avatar" style="width:22px;height:22px;font-size:10px">{{ avatar(comment.author) }}</span><div class="comment__body"><div class="comment__author">{{ comment.author?.name || 'Unknown' }}</div><div class="comment__text">{{ comment.body }}</div><div class="comment__actions"><details class="comment-edit"><summary class="comment-action">Edit</summary><form class="comment-edit__form" @submit.prevent="updateComment(comment, $event)"><input name="comment[body]" v-model="comment.draft" class="form-input"><button class="btn btn--small">Save</button></form></details><button class="comment-action" @click="deleteComment(comment)">Delete</button></div></div></div></div><form class="comment-form" @submit.prevent="addComment"><div v-if="error" class="form-errors">{{ error }}</div><input v-model="newComment" class="comment-input" placeholder="Add a comment..."><div class="comment-form__footer"><button class="btn">Add comment</button></div></form></div></main>`
