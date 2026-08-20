@@ -16,6 +16,15 @@
     "branch": { "type": "string", "minLength": 1, "maxLength": 160 },
     "pr_url": { "type": "string", "minLength": 1, "maxLength": 500 }
   },
-  "required": ["summary", "checks", "risks"],
+  "required": [
+    "summary",
+    "checks",
+    "risks",
+    "commit_message",
+    "pr_title",
+    "pr_body",
+    "branch",
+    "pr_url"
+  ],
   "additionalProperties": false
 }

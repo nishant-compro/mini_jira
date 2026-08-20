@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "checks": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 240 }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 240 }
+    }
+  },
+  "required": ["summary", "checks", "risks"],
+  "additionalProperties": false
+}

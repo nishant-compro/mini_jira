@@ -45,7 +45,7 @@ inputs:
 
 outputs:
   structured_output:
-    description: Agent-neutral JSON summary matching summary.schema.json
+    description: Agent-neutral JSON result matching the schema selected for the invocation mode
     value: ${{ steps.claude_openrouter.outputs.structured_output || steps.claude.outputs.structured_output || steps.codex_openrouter.outputs['final-message'] || steps.codex_chatgpt.outputs.structured_output || steps.codex_bedrock.outputs.structured_output }}
   execution_file:
     description: Path to the available execution evidence
@@ -76,6 +76,16 @@ runs:
         args_file="$RUNNER_TEMP/jira-agent-$MODE-claude-args"
         codex_home="$RUNNER_TEMP/jira-agent-$MODE-codex-home"
         mkdir -p "$codex_home"
+        if [ "$MODE" = validate ]; then
+          schema_file="$GITHUB_ACTION_PATH/validation.schema.json"
+        else
+          schema_file="$GITHUB_ACTION_PATH/summary.schema.json"
+        fi
+        jq -e '
+          type == "object" and
+          .additionalProperties == false and
+          ((.properties | keys | sort) == (.required | sort))
+        ' "$schema_file" > /dev/null
         {
           printf -- '--model "%s"\n' "$MODEL"
           if [ "$MODE" = validate ]; then
@@ -88,7 +98,7 @@ runs:
             echo '--allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git diff:*),Bash(git status:*),Bash(git add:*),Bash(git switch:*),Bash(git config:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*),Bash(gh auth setup-git),Bash(gh pr create:*),Bash(cd backend && bundle exec rspec:*),Bash(cd backend && bundle exec rubocop:*),Bash(cd frontend && npm ci),Bash(cd frontend && npm run build)"'
             echo '--disallowedTools "WebFetch,WebSearch,Bash(git merge:*),Bash(curl:*),Bash(wget:*)"'
           fi
-          printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$GITHUB_ACTION_PATH/summary.schema.json")"
+          printf -- "--json-schema '%s'\n" "$(tr -d '\n' < "$schema_file")"
         } > "$args_file"
 
         delimiter="claude_args_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$MODE"
@@ -98,6 +108,7 @@ runs:
           echo "$delimiter"
           echo "summary_file=$summary_file"
           echo "execution_file=$execution_file"
+          echo "schema_file=$schema_file"
           echo "codex_home=$codex_home"
           if [ "$MODE" = validate ]; then
             echo "codex_permission=:read-only"
@@ -186,7 +197,7 @@ runs:
         MODEL: ${{ inputs.model }}
         PROMPT: ${{ inputs.prompt }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
-        SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
+        SCHEMA_FILE: ${{ steps.prepare.outputs.schema_file }}
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
@@ -261,7 +272,7 @@ runs:
         responses-api-endpoint: https://openrouter.ai/api/v1/responses
         prompt: ${{ inputs.prompt }}
         output-file: ${{ steps.prepare.outputs.execution_file }}
-        output-schema-file: ${{ github.action_path }}/summary.schema.json
+        output-schema-file: ${{ steps.prepare.outputs.schema_file }}
         model: ${{ inputs.model }}
         codex-version: 0.147.0
         permission-profile: ${{ steps.prepare.outputs.codex_permission }}
@@ -280,7 +291,7 @@ runs:
         MODEL: ${{ inputs.model }}
         PROMPT: ${{ inputs.prompt }}
         PERMISSION: ${{ steps.prepare.outputs.codex_chatgpt_permission }}
-        SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
+        SCHEMA_FILE: ${{ steps.prepare.outputs.schema_file }}
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
         GH_TOKEN: ${{ inputs.github-token }}
@@ -347,7 +358,7 @@ runs:
         MODEL: ${{ inputs.model }}
         PROMPT: ${{ inputs.prompt }}
         PERMISSION: ${{ steps.prepare.outputs.codex_permission }}
-        SCHEMA_FILE: ${{ github.action_path }}/summary.schema.json
+        SCHEMA_FILE: ${{ steps.prepare.outputs.schema_file }}
         SUMMARY_FILE: ${{ steps.prepare.outputs.summary_file }}
         EXECUTION_FILE: ${{ steps.prepare.outputs.execution_file }}
         GH_TOKEN: ${{ inputs.github-token }}
