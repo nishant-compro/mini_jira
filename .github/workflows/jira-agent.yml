@@ -56,7 +56,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
-          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
           PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
         run: |
@@ -65,7 +64,7 @@ jobs:
             echo "::error::Jira dispatches must target main"
             exit 1
           fi
-          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_EMAIL JIRA_API_TOKEN PR_BOT_TOKEN; do
+          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_API_TOKEN PR_BOT_TOKEN; do
             if [ -z "${!name}" ]; then
               echo "::error::Required Jira agent configuration $name is missing"
               exit 1
@@ -82,7 +81,6 @@ jobs:
           BASE_SHA: ${{ steps.config.outputs.base_sha }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
-          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           CHECK_DUPLICATE: "true"
@@ -297,7 +295,6 @@ jobs:
         env:
           ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
           JIRA_COMMENT: "AI branch ${{ steps.branch.outputs.branch }} published as ${{ steps.pr.outputs.pr_url }}. Full CI and human review are pending. Run: ${{ env.RUN_URL }}"
         run: ruby .github/scripts/jira-agent/comment.rb
@@ -318,7 +315,6 @@ jobs:
         env:
           ISSUE_KEY: ${{ needs.admit.outputs.issue_key || inputs.issue_key }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_AGENT_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
           ADMIT_RESULT: ${{ needs.admit.result }}
           IMPLEMENT_RESULT: ${{ needs.implement.result }}

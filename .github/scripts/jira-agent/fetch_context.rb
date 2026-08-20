@@ -1,7 +1,6 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "base64"
 require "fileutils"
 require "json"
 require "net/http"
@@ -115,12 +114,10 @@ event_id = required_env("EVENT_ID")
 raise RequestError, "event_id contains unsupported characters" unless event_id.match?(/\A[A-Za-z0-9_.:-]{1,128}\z/)
 
 jira_url = required_env("JIRA_BASE_URL")
-jira_email = required_env("JIRA_EMAIL")
 jira_token = required_env("JIRA_API_TOKEN")
-basic = Base64.strict_encode64("#{jira_email}:#{jira_token}")
 jira = JsonClient.new(
   base_url: jira_url,
-  headers: { "Accept" => "application/json", "Authorization" => "Basic #{basic}" }
+  headers: { "Accept" => "application/json", "Authorization" => "Bearer #{jira_token}" }
 )
 
 issue = jira.get("rest/api/3/issue/#{URI.encode_www_form_component(issue_key)}?fields=summary,description,assignee")

@@ -1,7 +1,6 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "base64"
 require "json"
 require "net/http"
 require "uri"
@@ -15,7 +14,7 @@ uri = URI.join("#{base.to_s.delete_suffix("/")}/", "rest/api/3/issue/#{URI.encod
 request = Net::HTTP::Post.new(uri)
 request["Accept"] = "application/json"
 request["Content-Type"] = "application/json"
-request["Authorization"] = "Basic #{Base64.strict_encode64("#{ENV.fetch("JIRA_EMAIL")}:#{ENV.fetch("JIRA_API_TOKEN")}")}"
+request["Authorization"] = "Bearer #{ENV.fetch("JIRA_API_TOKEN")}"
 request.body = JSON.generate(
   body: {
     type: "doc",
