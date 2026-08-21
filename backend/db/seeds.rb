@@ -48,6 +48,7 @@ ticket_data = [
     t.description = "Details for #{attrs[:title].downcase}. This ticket tracks the work needed to complete the task and keep the project on schedule."
   end
 end
+# Sample seed data.
 
 pricing_ticket = ticket_data.find { |t| t.title == "Add pricing page" }
 
@@ -60,4 +61,4 @@ if pricing_ticket
     Comment.find_or_create_by!(ticket: pricing_ticket, user: attrs[:user], body: attrs[:body])
   end
 end
-
+# Seed data complete.

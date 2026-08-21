@@ -2,7 +2,7 @@ module ApplicationHelper
   def avatar_for(user, size: 22, accent: false)
     return content_tag(:div, "", class: "avatar", style: "width:#{size}px;height:#{size}px;") unless user
 
-    classes = ["avatar"]
+    classes = [ "avatar" ]
     classes << "avatar--accent" if accent
     font_size = size <= 24 ? 10 : 11
 
@@ -37,4 +37,4 @@ module ApplicationHelper
                 width: size, height: size, class: "icon", fill: "currentColor", stroke: "currentColor")
   end
 end
-
+# View helper definitions.
