@@ -58,14 +58,13 @@ jobs:
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
-          PR_BOT_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             echo "::error::Jira dispatches must target main"
             exit 1
           fi
-          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_API_TOKEN PR_BOT_TOKEN; do
+          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_API_TOKEN; do
             if [ -z "${!name}" ]; then
               echo "::error::Required Jira agent configuration $name is missing"
               exit 1
@@ -171,6 +170,31 @@ jobs:
           chmod 700 "$hooks_dir/pre-push"
           git config core.hooksPath "$hooks_dir"
 
+      - name: Create GitHub App installation token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.JIRA_AGENT_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JIRA_AGENT_GITHUB_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Resolve and configure GitHub App identity
+        id: app_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          case "$user_id" in
+            ''|*[!0-9]*) echo "::error::GitHub App bot user ID is invalid"; exit 1 ;;
+          esac
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          echo "user_id=$user_id" >> "$GITHUB_OUTPUT"
+
       - name: Prepare trusted publication contract
         id: publication
         shell: bash
@@ -178,6 +202,8 @@ jobs:
           ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          APP_USER_ID: ${{ steps.app_identity.outputs.user_id }}
         run: |
           set -euo pipefail
           branch="ai/$(printf '%s' "$ISSUE_KEY" | tr '[:upper:]' '[:lower:]')-${GITHUB_RUN_ID}"
@@ -189,13 +215,17 @@ jobs:
             --arg base_sha "$BASE_SHA" \
             --arg jira_url "$jira_url" \
             --arg run_url "$RUN_URL" \
+            --arg git_user_name "${APP_SLUG}[bot]" \
+            --arg git_user_email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com" \
             '{
               issue_key: $issue_key,
               branch: $branch,
               base_branch: $base_branch,
               base_sha: $base_sha,
               jira_url: $jira_url,
-              run_url: $run_url
+              run_url: $run_url,
+              git_user_name: $git_user_name,
+              git_user_email: $git_user_email
             }' > .jira-agent/publication.json
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
@@ -212,7 +242,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           codex-auth-json: ${{ secrets.CODEX_AUTH_JSON }}
-          github-token: ${{ secrets.PR_BOT_TOKEN }}
+          github-token: ${{ steps.app_token.outputs.token }}
           role-session-name: jira-agent-${{ github.run_id }}
           prompt: Implement the Jira ticket described in .jira-agent/task.md.
 

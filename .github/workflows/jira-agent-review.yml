@@ -1,0 +1,380 @@
+name: Jira Agent Review Revision
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: jira-agent-task-queue
+  queue: max
+
+permissions:
+  contents: read
+
+env:
+  RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  admit:
+    name: Validate requested changes review
+    if: github.event.review.state == 'changes_requested'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      issue_key: ${{ steps.context.outputs.issue_key }}
+      review_id: ${{ steps.context.outputs.review_id }}
+      pr_number: ${{ steps.context.outputs.pr_number }}
+      pr_url: ${{ steps.context.outputs.pr_url }}
+      branch: ${{ steps.context.outputs.branch }}
+      head_sha: ${{ steps.context.outputs.head_sha }}
+      base_sha: ${{ steps.context.outputs.base_sha }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Validate review and sanitize feedback
+        id: context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JIRA_AGENT_GITHUB_APP_SLUG: ${{ vars.JIRA_AGENT_GITHUB_APP_SLUG }}
+        run: ruby .github/scripts/jira-agent/prepare_review_context.rb .jira-agent
+
+      - name: Upload sanitized review context
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jira-review-context-${{ steps.context.outputs.review_id }}
+          path: .jira-agent/
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: true
+
+  revise:
+    name: Address requested changes
+    needs: admit
+    if: needs.admit.result == 'success'
+    runs-on: ubuntu-latest
+    environment: jira-agent-runtime
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      passed: ${{ steps.result.outputs.passed }}
+      branch: ${{ steps.result.outputs.branch }}
+      pr_url: ${{ steps.result.outputs.pr_url }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out reviewed pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.admit.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject protected changes in reviewed pull request
+        env:
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          changed_paths=$(git diff --name-only "$merge_base" "$HEAD_SHA")
+          while IFS= read -r path; do
+            case "$path" in
+              .github/*|.agents/*|.claude/*|AGENTS.md|CLAUDE.md|.gitignore|*/AGENTS.md|*/AGENTS.override.md|*/CLAUDE.md|*/CLAUDE.local.md)
+                echo "::error::Reviewed pull request changes protected path $path"
+                exit 1
+                ;;
+            esac
+          done <<EOF
+          $changed_paths
+          EOF
+
+      - name: Create local revision branch
+        env:
+          BRANCH: ${{ needs.admit.outputs.branch }}
+          HEAD_SHA: ${{ needs.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git switch --create "$BRANCH" "$HEAD_SHA"
+          printf '/trusted/\n' >> .git/info/exclude
+
+      - name: Download sanitized review context
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jira-review-context-${{ needs.admit.outputs.review_id }}
+          path: .jira-agent
+
+      - name: Validate deployment configuration
+        id: config
+        env:
+          CODING_AGENT: ${{ vars.CODING_AGENT }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_ID: ${{ vars.MODEL_ID }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          for name in JIRA_BASE_URL JIRA_AGENT_ACCOUNT_ID JIRA_API_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required Jira agent configuration $name is missing"
+              exit 1
+            fi
+          done
+          ruby trusted/.github/scripts/jira-agent/validate_runtime_config.rb
+
+      - name: Fetch and sanitize Jira context
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          EVENT_ID: review-${{ needs.admit.outputs.review_id }}
+          BASE_SHA: ${{ needs.admit.outputs.head_sha }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_AGENT_ACCOUNT_ID: ${{ vars.JIRA_AGENT_ACCOUNT_ID }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          CHECK_DUPLICATE: "false"
+          POST_ACCEPTED: "false"
+          REQUIRE_ASSIGNEE: "false"
+        run: ruby trusted/.github/scripts/jira-agent/fetch_context.rb .jira-agent
+
+      - name: Print final sanitized agent context
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in .jira-agent/task.md .jira-agent/review.md .jira-agent/review-metadata.json; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected agent context file $file is missing"
+              exit 1
+            fi
+            echo "::group::$file"
+            sed -n '1,$p' "$file"
+            echo "::endgroup::"
+          done
+
+      - name: Prepare backend test dependencies
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b
+        with:
+          working-directory: backend
+          bundler-cache: true
+
+      - name: Prepare frontend test runtime
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Stage trusted patch validator outside the model worktree
+        env:
+          BASE_SHA: ${{ needs.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          verifier_dir="$RUNNER_TEMP/jira-agent-review-verifier"
+          hooks_dir="$verifier_dir/hooks"
+          mkdir -p "$hooks_dir"
+          cp trusted/.github/scripts/jira-agent/validate_patch.rb "$verifier_dir/validate_patch.rb"
+          cat > "$hooks_dir/pre-push" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          patch="$verifier_dir/pre-push.patch"
+          git diff --binary --full-index "$BASE_SHA" -- . > "\$patch"
+          ruby "$verifier_dir/validate_patch.rb" --already-applied "\$patch" > /dev/null
+          EOF
+          chmod 700 "$hooks_dir/pre-push"
+          git config core.hooksPath "$hooks_dir"
+
+      - name: Create GitHub App installation token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.JIRA_AGENT_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JIRA_AGENT_GITHUB_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Resolve GitHub App bot identity
+        id: app_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          case "$user_id" in
+            ''|*[!0-9]*) echo "::error::GitHub App bot user ID is invalid"; exit 1 ;;
+          esac
+          echo "user_id=$user_id" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Git identity for GitHub App
+        shell: bash
+        env:
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          APP_USER_ID: ${{ steps.app_identity.outputs.user_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Prepare trusted revision contract
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          BRANCH: ${{ needs.admit.outputs.branch }}
+          BASE_SHA: ${{ needs.admit.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.admit.outputs.pr_number }}
+          PR_URL: ${{ needs.admit.outputs.pr_url }}
+          REVIEW_ID: ${{ needs.admit.outputs.review_id }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          APP_USER_ID: ${{ steps.app_identity.outputs.user_id }}
+        run: |
+          set -euo pipefail
+          jira_url="${JIRA_BASE_URL%/}/browse/${ISSUE_KEY}"
+          jq -n \
+            --arg mode revision \
+            --arg issue_key "$ISSUE_KEY" \
+            --arg branch "$BRANCH" \
+            --arg base_branch main \
+            --arg base_sha "$BASE_SHA" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg pr_url "$PR_URL" \
+            --arg review_id "$REVIEW_ID" \
+            --arg jira_url "$jira_url" \
+            --arg run_url "$RUN_URL" \
+            --arg git_user_name "${APP_SLUG}[bot]" \
+            --arg git_user_email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com" \
+            '{
+              mode: $mode,
+              issue_key: $issue_key,
+              branch: $branch,
+              base_branch: $base_branch,
+              base_sha: $base_sha,
+              pr_number: $pr_number,
+              pr_url: $pr_url,
+              review_id: $review_id,
+              jira_url: $jira_url,
+              run_url: $run_url,
+              git_user_name: $git_user_name,
+              git_user_email: $git_user_email
+            }' > .jira-agent/publication.json
+
+      - name: Address requested changes
+        id: agent
+        continue-on-error: true
+        uses: ./trusted/.github/actions/run-jira-coding-agent
+        with:
+          coding-agent: ${{ steps.config.outputs.coding_agent }}
+          model-provider: ${{ steps.config.outputs.model_provider }}
+          model: ${{ steps.config.outputs.implementer_model }}
+          mode: revise
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          codex-auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+          github-token: ${{ steps.app_token.outputs.token }}
+          role-session-name: jira-agent-review-${{ github.run_id }}
+          prompt: |
+            This is a revision run. Address the requested changes in the sanitized Jira
+            task and review context. Remain on the configured existing branch, create
+            exactly one new commit on its captured head, and push it normally. Do not
+            create another branch or pull request, force-push, modify PR metadata,
+            approve, merge, or enable auto-merge. Return only the revision schema.
+
+      - name: Verify revision publication
+        id: result
+        if: always()
+        shell: bash
+        env:
+          REVISE: ${{ steps.agent.outcome }}
+          AGENT_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+          START_SHA: ${{ needs.admit.outputs.head_sha }}
+          EXPECTED_BRANCH: ${{ needs.admit.outputs.branch }}
+          EXPECTED_PR_URL: ${{ needs.admit.outputs.pr_url }}
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ "$REVISE" != success ]; then
+            echo "::error::Agent revision failed"
+            exit 1
+          fi
+          if ! printf '%s' "$AGENT_OUTPUT" | jq -e \
+            --arg branch "$EXPECTED_BRANCH" \
+            --arg pr_url "$EXPECTED_PR_URL" '
+              type == "object" and
+              (keys | sort == ["branch", "checks", "commit_message", "pr_url", "risks", "summary"]) and
+              (.summary | type == "string" and length > 0 and length <= 500) and
+              (.checks | type == "array" and all(.[]; type == "string" and length <= 240)) and
+              (.risks | type == "array" and all(.[]; type == "string" and length <= 240)) and
+              (.commit_message | type == "string" and length > 0 and length <= 72) and
+              (.branch == $branch) and
+              (.pr_url == $pr_url)
+            ' > /dev/null; then
+            echo "::error::Agent completed without valid revision output"
+            exit 1
+          fi
+          [ "$(git branch --show-current)" = "$EXPECTED_BRANCH" ]
+          [ "$(git rev-list --count "$START_SHA"..HEAD)" = 1 ]
+          [ "$(git rev-parse HEAD^)" = "$START_SHA" ]
+          [ "$(git log -1 --pretty=%s)" = "$(printf '%s' "$AGENT_OUTPUT" | jq -r .commit_message)" ]
+          mkdir -p candidate
+          git diff --binary --full-index "$START_SHA" -- . > candidate/change.patch
+          ruby "$RUNNER_TEMP/jira-agent-review-verifier/validate_patch.rb" --already-applied candidate/change.patch > /dev/null
+          remote_pr=$(GH_TOKEN="$APP_TOKEN" gh pr view "$EXPECTED_BRANCH" --repo "$GITHUB_REPOSITORY" \
+            --json headRefName,headRefOid,baseRefName,state,url)
+          printf '%s' "$remote_pr" | jq -e \
+            --arg branch "$EXPECTED_BRANCH" \
+            --arg head "$(git rev-parse HEAD)" \
+            --arg url "$EXPECTED_PR_URL" '
+              .headRefName == $branch and
+              .headRefOid == $head and
+              .baseRefName == "main" and
+              .state == "OPEN" and
+              .url == $url
+            ' > /dev/null
+          {
+            echo "passed=true"
+            echo "branch=$EXPECTED_BRANCH"
+            echo "pr_url=$EXPECTED_PR_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clear any model credential residue
+        if: always()
+        run: |
+          {
+            echo "AWS_ACCESS_KEY_ID="
+            echo "AWS_SECRET_ACCESS_KEY="
+            echo "AWS_SESSION_TOKEN="
+            echo "AWS_SECURITY_TOKEN="
+            echo "ANTHROPIC_AUTH_TOKEN="
+            echo "ANTHROPIC_API_KEY="
+            echo "OPENROUTER_API_KEY="
+            echo "CODEX_API_KEY="
+            echo "CODEX_AUTH_JSON="
+            echo "GH_TOKEN="
+          } >> "$GITHUB_ENV"
+
+      - name: Update Jira with revision link
+        if: steps.result.outputs.passed == 'true'
+        env:
+          ISSUE_KEY: ${{ needs.admit.outputs.issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_AGENT_API_TOKEN }}
+          JIRA_COMMENT: "AI revision for ${{ steps.result.outputs.pr_url }} was published after requested changes review ${{ needs.admit.outputs.review_id }}. Run: ${{ env.RUN_URL }}"
+        run: ruby trusted/.github/scripts/jira-agent/comment.rb

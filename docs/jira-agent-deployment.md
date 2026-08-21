@@ -6,13 +6,15 @@ The automation uses step-scoped credentials:
 Jira assignment -> queued dispatch -> sanitized context -> configured coding agent
   -> implementation and agent-run checks -> agent commit/push/PR
   -> record publication -> complete CI
+  -> requested-changes review -> sanitized revision -> agent commit/push
   -> human review and merge
 ```
 
-The implementation job exposes Bedrock, OpenRouter, or ChatGPT credentials and the
-scoped PR bot token only to the selected agent invocation. The invocation implements,
-tests, commits, pushes its assigned branch, and creates the pull request. One final
-cleanup clears residual values after the invocation.
+The implementation job exposes Bedrock, OpenRouter, or ChatGPT credentials and a
+short-lived GitHub App installation token only to the selected agent invocation. The
+invocation implements, tests, commits, pushes its assigned branch, and creates the
+pull request as the GitHub App bot. One final cleanup clears residual values after the
+invocation.
 
 ## End-to-end flow
 
@@ -67,8 +69,8 @@ registers it as a pre-push hook. The hook blocks unsafe patches before publicati
 After the invocation, the workflow records the agent-reported PR and adds a visible
 job summary; it does not rerun tests or revalidate the published PR. Build CI then
 runs independently on the PR, which remains for human review.
-All implementation adapters receive `PR_BOT_TOKEN` as `GH_TOKEN`; model-provider
-authentication remains separate.
+All implementation adapters receive the GitHub App installation token as `GH_TOKEN`;
+model-provider authentication remains separate.
 
 ## Deployment setup
 
@@ -119,13 +121,15 @@ authentication remains separate.
    | `MODEL_ID` | Exact model ID |
    | `AWS_ROLE_ARN` | Required for Bedrock only |
    | `AWS_REGION` | Required for Bedrock only |
+   | `JIRA_AGENT_GITHUB_APP_CLIENT_ID` | Client ID for the installed GitHub App |
+   | `JIRA_AGENT_GITHUB_APP_SLUG` | GitHub App slug, for example `agent-mordekaiser` |
 
 3. Add these repository secrets:
 
    | Secret | Purpose |
    | --- | --- |
    | `JIRA_AGENT_API_TOKEN` | Scoped Jira service-account token |
-   | `PR_BOT_TOKEN` | Let the agent push its assigned branch and create its pull request |
+   | `JIRA_AGENT_GITHUB_APP_PRIVATE_KEY` | Private key for the installed GitHub App |
    | `OPENROUTER_API_KEY` | Required for OpenRouter only |
    | `CODEX_AUTH_JSON` | Required for Codex with ChatGPT only |
 
@@ -138,19 +142,39 @@ Supported combinations:
 | Claude Code | Yes | Yes | No |
 | Codex | Yes | Yes | Yes |
 
-### 4. Create `PR_BOT_TOKEN`
+### 4. Configure the GitHub App publisher
 
-1. Open **GitHub Settings > Developer settings > Personal access tokens > Fine-grained
-   tokens > Generate new token**.
-2. Set the repository owner, select only this repository, and choose the shortest
-   practical rotation period.
-3. Grant repository permissions:
-   - **Contents: Read and write**
-   - **Pull requests: Read and write**
-   - Metadata read access is added automatically.
-4. Save the token as the GitHub repository secret `PR_BOT_TOKEN`.
+1. Create and install the private GitHub App on only this repository.
+2. Grant the App **Contents: Read and write** and **Pull requests: Read and write**.
+   Do not grant administration, Actions, merge, approval, or branch-protection bypass
+   permissions.
+3. Save the App client ID as the repository variable
+   `JIRA_AGENT_GITHUB_APP_CLIENT_ID` and a generated private key as the
+   `JIRA_AGENT_GITHUB_APP_PRIVATE_KEY` secret available to `jira-agent-runtime`.
+4. The workflow creates a repository-scoped installation token at runtime. GitHub
+   attributes commits and pull requests to `<app-slug>[bot]`; no personal access token
+   is used for publication.
 
-### 5. Create the GitHub dispatch token
+Installation tokens expire after one hour. The workflow generates its token directly
+before invoking the coding agent; keep implementation runs within that window.
+
+### 5. Enable requested-changes revisions
+
+`jira-agent-review.yml` runs when a pull-request review is submitted with **Request
+changes**. It only accepts reviews that meet all of these conditions:
+
+- The pull request is open, targets `main`, originates from this repository, and was
+  created by `<JIRA_AGENT_GITHUB_APP_SLUG>[bot]` on an `ai/<issue>-<run>` branch.
+- The review is current for the pull request head and includes a summary or inline
+  feedback.
+- The reviewer has effective repository write access.
+
+The workflow sanitizes the review summary and its inline comments, then makes exactly
+one additional commit on the existing pull-request branch. It never force-pushes or
+creates another pull request. The normal **Build** workflow runs again after that
+commit is pushed.
+
+### 6. Create the GitHub dispatch token
 
 Create a second fine-grained token for Jira dispatches:
 
@@ -162,11 +186,12 @@ Create a second fine-grained token for Jira dispatches:
    repository.
 4. Under **Repository permissions**, grant **Actions: Read and write**. Do not add
    Contents or Pull requests write permission to this token.
-5. Generate the token, copy it once, and keep it separate from `PR_BOT_TOKEN`.
+5. Generate the token and keep it separate from the GitHub App credentials.
 
-The dispatch token only starts `jira-agent.yml`. Never reuse `PR_BOT_TOKEN` here.
+The dispatch token only starts `jira-agent.yml`. Never reuse it as a GitHub App
+credential.
 
-### 6. Create the Jira Automation rule
+### 7. Create the Jira Automation rule
 
 In the relevant Jira space, open **Spaces settings > Automation**, create a rule,
 and configure it as follows:
@@ -272,9 +297,9 @@ resolution, and these checks from the **Build** workflow:
 - Secret scan
 - SonarQube
 
-Do not allow the Jira agent AWS role, Jira dispatch identity, `PR_BOT_TOKEN`, or any
-GitHub App used here to bypass protection, approve pull requests, merge, delete the
-branch, or push to `main`. Do not enable auto-merge.
+Do not allow the Jira agent AWS role, Jira dispatch identity, or GitHub App used here
+to bypass protection, approve pull requests, merge, delete the branch, or push to
+`main`. Do not enable auto-merge.
 
 ## Agent-run verification and retention
 
@@ -300,6 +325,10 @@ Before production assignment, exercise a disposable Jira project and confirm:
 6. Build CI runs normally on the published PR and never modifies its branch.
 7. Failed local automation retains its Actions logs; successful automation still
    cannot approve, merge, or bypass `main` protection.
+8. An authorized requested-changes review with summary or inline feedback creates one
+   additional App-authored commit on the same PR, reruns Build CI, and does not create
+   another PR. Unauthorized, stale, empty, forked, and non-bot PR reviews stop before
+   model or App credentials are exposed.
 
 All third-party Actions references are immutable commit SHAs. Review upstream release
 notes and update those SHAs through an ordinary human-reviewed PR.
