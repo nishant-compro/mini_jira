@@ -82,6 +82,8 @@ jobs:
         with:
           ref: ${{ needs.admit.outputs.head_sha }}
           fetch-depth: 0
+          # Keep the trusted default-branch checkout created above.
+          clean: false
           persist-credentials: false
 
       - name: Reject protected changes in reviewed pull request
