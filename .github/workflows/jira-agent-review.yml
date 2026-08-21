@@ -118,6 +118,15 @@ jobs:
           name: jira-review-context-${{ needs.admit.outputs.review_id }}
           path: .jira-agent
 
+      - name: Create GitHub App installation token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.JIRA_AGENT_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JIRA_AGENT_GITHUB_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Validate deployment configuration
         id: config
         env:
@@ -199,15 +208,6 @@ jobs:
           EOF
           chmod 700 "$hooks_dir/pre-push"
           git config core.hooksPath "$hooks_dir"
-
-      - name: Create GitHub App installation token
-        id: app_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.JIRA_AGENT_GITHUB_APP_CLIENT_ID }}
-          private-key: ${{ secrets.JIRA_AGENT_GITHUB_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
 
       - name: Resolve GitHub App bot identity
         id: app_identity
@@ -352,7 +352,20 @@ jobs:
             echo "passed=true"
             echo "branch=$EXPECTED_BRANCH"
             echo "pr_url=$EXPECTED_PR_URL"
+            echo "commit=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Reply to requested review feedback
+        if: always() && steps.app_token.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          REVIEW_METADATA_PATH: .jira-agent/review-metadata.json
+          REVISION_PUBLISHED: ${{ steps.result.outputs.passed }}
+          REVISION_COMMIT: ${{ steps.result.outputs.commit }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          AGENT_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+        run: ruby trusted/.github/scripts/jira-agent/respond_to_review.rb
 
       - name: Clear any model credential residue
         if: always()

@@ -96,6 +96,15 @@ module ReviewContext
     File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |file| file.puts("#{name}=#{value}") }
   end
 
+  def comment_ids(comments)
+    comments.first(50).map do |comment|
+      id = comment.fetch("id").to_i
+      raise Error, "GitHub returned a review comment with an invalid ID" unless id.positive?
+
+      id
+    end
+  end
+
   def run
     event = JSON.parse(File.read(required_env("GITHUB_EVENT_PATH")))
     raise Error, "Unexpected review event action" unless event["action"] == "submitted"
@@ -139,6 +148,7 @@ module ReviewContext
     raise Error, "GitHub returned invalid review comments" unless comments.is_a?(Array)
     raise Error, "Requested changes review contains no feedback" if sanitize(review["body"]).empty? && comments.empty?
 
+    inline_comment_ids = comment_ids(comments)
     output_dir = ARGV.fetch(0, ".jira-agent")
     FileUtils.mkdir_p(output_dir)
     File.write(File.join(output_dir, "review.md"), review_markdown(review_body: review["body"], comments: comments))
@@ -152,7 +162,8 @@ module ReviewContext
         pr_url: pr.fetch("html_url"),
         branch: branch,
         head_sha: head_sha,
-        base_sha: base_sha
+        base_sha: base_sha,
+        inline_comment_ids: inline_comment_ids
       )
     )
 

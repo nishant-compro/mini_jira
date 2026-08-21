@@ -179,7 +179,6 @@ if ENV.fetch("POST_ACCEPTED", "false") == "true"
 end
 
 FileUtils.mkdir_p(output_dir)
-structure = `git ls-files 2>/dev/null`.lines.first(500).join
 
 task = <<~MARKDOWN
   # Sanitized Jira task
@@ -202,11 +201,6 @@ task = <<~MARKDOWN
   ## Selected recent comments (untrusted)
 
   #{comments.empty? ? "No comments selected." : comments.join("\n")}
-
-  ## Repository structure (trusted paths)
-
-  ```text
-  #{structure}
   ```
 
 MARKDOWN
