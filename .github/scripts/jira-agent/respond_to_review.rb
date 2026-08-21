@@ -28,7 +28,7 @@ module ReviewResponse
     response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 30) do |http|
       http.request(request)
     end
-    raise Error, "GitHub API request returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+    raise Error, "GitHub API #{method.upcase} #{path} returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
 
     response.body.empty? ? nil : JSON.parse(response.body)
   rescue JSON::ParserError
@@ -86,7 +86,9 @@ module ReviewResponse
   end
 
   def upsert_inline_reply(repo:, pr_number:, comment_id:, token:, login:, response_marker:, body:)
-    replies = api_request("get", "repos/#{repo}/pulls/#{pr_number}/comments/#{comment_id}/replies?per_page=100", token)
+    replies = api_request("get", "repos/#{repo}/pulls/#{pr_number}/comments?per_page=100", token).select do |comment|
+      comment["in_reply_to_id"].to_i == comment_id
+    end
     existing = find_existing(replies, login, response_marker)
     if existing
       api_request("patch", "repos/#{repo}/pulls/comments/#{existing.fetch("id")}", token, body: { body: body })
